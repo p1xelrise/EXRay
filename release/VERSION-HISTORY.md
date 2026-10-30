@@ -1,0 +1,100 @@
+# EXRay: version history
+
+Everything added so far, newest first.
+
+## v0.9.8 beta: Open source
+- **EXRay is open source** under the GNU GPL v3 (or later). The source code is on GitHub: https://github.com/p1xelrise/EXRay
+- Still free, with every feature, for personal use and paid client work. Supporting it stays optional.
+- The name "EXRay" and its logo stay reserved: modified versions must use another name and logo (TRADEMARKS.md).
+- Help menu: "Source code on GitHub" and "Support EXRay". About and Licenses show the new license.
+- LICENSE.txt now holds the GNU GPL v3; bug reports are welcome as GitHub Issues.
+
+## v0.9.7 beta: Fix HDRI, tested on real HDRIs
+- **Tested against real photographs:** HDRIs with real, unclipped suns were clipped on purpose, fixed by EXRay and compared with the originals (6 HDRIs, 3 clip levels each). With the right sky choice the rebuilt sun gives 75–122 % of the real light every time; a clipped sun keeps only 4–31 %.
+- **Sky: Clear / Light haze / Hazy** replaces Strength. Haze moves light from the sun to the sky, so the same sky means a weaker sun. A clipped file no longer shows how hazy it was, so you pick what you see.
+- **Better clear-sky estimate**, fitted to real clear skies (it was too weak for a high sun).
+- **No more false alarms:** a sun that isn't clipped is no longer reported as clipped.
+- **Wide glow:** a clipped area wider than 2° (hazy or sunset sun) is reported but not ticked, because a sharp sun there would add far too much light.
+- Sun colour now defaults to "From the glow", which matched the real suns in the tests.
+- **Sun check (S)** sets the exposure for a real sun instead of a fixed −10 EV, and the status bar shows the numbers, e.g. "clipped sun 2,000 → rebuilt 126,000".
+- About: "Calibrate" added to the v0.10 plan (light level in lux, scale to a measured value or preset, white balance, sRGB / ACEScg).
+
+## v0.9.6 beta: Better sun fixing
+- **Fix HDRI shows how much light is missing:** e.g. "It holds less than 1 % of the light a clear-sky sun there would give".
+- **Sun size:** real 0.53°, 1°, 2° or 4°. A bigger sun gives softer shadows with the same total light.
+- **Sun colour:** "From the glow" or "Natural for its height" (warm near the horizon, nearly white high up). When the glow around a clipped sun is almost white, the natural colour is chosen for you.
+- **Sun check (S):** the 360° view looks straight at the sun at −10 EV. A real sun stays a small bright disc; a clipped one fades into a dim grey blob. Press S again to go back. Also a "Sun check" button in the Fix HDRI window.
+- The Version history page was removed from the app. It lives in VERSION-HISTORY.txt, next to the .exe.
+
+## v0.9.5 beta: Free for everyone
+- EXRay is free: every feature, no time limit, no Pro version. The Pro preview of v0.9.4 is gone.
+- About: "Download page and support" link. Paying is optional.
+
+## v0.9.4 beta: Pro preview
+- Public beta: the Free features are permanent. The Pro features (Fix HDRI, Cryptomatte names and masks, batch export) work until **31 March 2027**; after that EXRay keeps working as EXRay Free.
+- Pro features are labelled in the menus, and a short note explains them after the preview.
+
+## v0.9.3
+- About: new roadmap (HDRI prep, HDRI library, Inspect, v1.0 launch) and the plan for EXRay Free and EXRay Pro.
+
+## v0.9.2: EXRay
+- New name: **EXRay** (was "HDR & EXR file preview"). Settings move to EXRay.ini; the old settings file is read once if it's there.
+- Dark menu bar and dark menus, matching the rest of the app.
+- Fix HDRI: pixel counts shown as whole numbers ("7 pixels", not "7.00").
+
+## v0.9.1
+- Opens very large .hdr files (over 2 GB once decoded, e.g. 24K–32K HDRIs) that showed "Not supported" before.
+- Thumbnails of huge .hdr files are made with a fraction of the memory.
+- Also reads .hdr files stored bottom-up (+Y).
+
+## v0.9: Fix HDRI
+- **Fix button (H)** checks the HDRI and reports what it finds: a clipped sun, broken pixels, hot pixels, or an ordinary picture saved as HDR (nothing above 1.0).
+- **Clipped sun rebuilt** as a disc of the real size (0.53°). Its brightness is estimated from the sky around it, using a clear-sky sun-to-sky ratio for the sun's height. Sun strength can be set from −2 to +2 EV. A sun that isn't clipped is left alone. Clipped areas that are too large (windows, overexposed sky) or below the horizon are reported but not changed.
+- **Broken pixels repaired**: NaN and infinite values take their neighbours' average, and negative values become 0. **Hot pixels** take their neighbours' median. Many tiny bright points (stars, small lights) aren't ticked by default.
+- **B** shows before / after. **Ctrl+S** saves a copy as OpenEXR 32-bit float, OpenEXR 16-bit half, or Radiance .hdr. The original is never changed, and the app asks before you leave an unsaved fix.
+- **Help > Version history** page added.
+
+## v0.8.3
+- About: the free-use line moved under the e-mail address.
+
+## v0.8.2
+- Version number in the window title.
+- About: free-use line and a Licenses page for the included libraries.
+
+## v0.8.1
+- About: "Coming next" roadmap, fuller "Built with", and contact details with the pixelrise logo and e-mail link.
+
+## v0.8: 360° view
+- Look around inside 2:1 equirectangular HDRIs: drag to look, wheel to change the field of view, double-click to reset (V turns it on).
+
+## v0.7: Help pages
+- Controls and shortcuts window (F1) with aligned columns (replaces "Keyboard and mouse").
+- About page: what the tool does, main features, next updates.
+
+## v0.6: Export look and data passes
+- Export look: Clip (raw render look, the default), ACES, or as shown on screen.
+- Readable depth, normal and motion-vector / position passes; I inverts the depth view.
+
+## v0.5: Cryptomatte and batch export
+- Cryptomatte: ID colours, object / material names under the mouse, click to isolate a mask.
+- Grid multi-select (Ctrl, Shift, Ctrl+A) and exporting a whole selection to a folder.
+- Thumbnail size slider (50–200%).
+- Settings remembered in HDR-EXR-Preview.ini next to the .exe.
+
+## v0.4: Layers and export
+- EXR layers, multi-part and multi-view files (L and [ ] to switch).
+- Pixel readout of the real stored values; Ctrl+C copies them.
+- Export as PNG or JPEG (Ctrl+E).
+
+## v0.3: Thumbnail grid
+- A whole folder as 312 × 156 thumbnails, made in the background.
+- Very large images are decoded one at a time; Grid | Image switch.
+
+## v0.2: Viewing controls
+- Exposure slider (−10 to +10 EV), Clip / Reinhard / ACES tonemaps.
+- Zoom, pan, Fit / 100%, arrow keys through the folder.
+- Live preview for big images, full resolution right after.
+
+## v0.1: First version
+- Opens .hdr and .exr files (drag & drop, File > Open, or the command line) and shows them tonemapped.
+- One portable .exe for Windows 11, nothing to install.
