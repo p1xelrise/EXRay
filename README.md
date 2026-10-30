@@ -9,6 +9,7 @@ Photoshop. One small portable `.exe`, nothing to install, works fully offline.
 
 **[⬇ Download the latest release](https://github.com/p1xelrise/EXRay/releases/latest)** ·
 [Download page](https://p1xelrise.gumroad.com/l/exray) ·
+[Sponsor](https://github.com/sponsors/p1xelrise) ·
 [Version history](release/VERSION-HISTORY.md) ·
 [Report a bug](https://github.com/p1xelrise/EXRay/issues)
 
@@ -60,9 +61,10 @@ Requirements: Windows 11, 64-bit.
 ## Support EXRay
 
 EXRay is free, with every feature, for personal use and paid client work. If it
-saves you time, you can support it with a payment of your choice on the
-[download page](https://p1xelrise.gumroad.com/l/exray). It's optional and
-changes nothing in the app. Starring the repository and telling other artists
+saves you time, you can support it through
+[GitHub Sponsors](https://github.com/sponsors/p1xelrise) or with a payment of your
+choice on the [download page](https://p1xelrise.gumroad.com/l/exray). It's
+optional and changes nothing in the app. Starring the repository and telling other artists
 about it helps too.
 
 ## Build it yourself
