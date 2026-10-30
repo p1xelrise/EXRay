@@ -150,6 +150,8 @@ void ThumbPool::WorkerLoop() {
                         res->imageHeight = h > 0 ? h : img.height;
                         res->format = img.format;
                         res->thumb = MakeThumbnail(img, boxW, boxH);
+                        ImageQuickStats(img, res->peakLum, res->rangeStops);
+                        res->statsReduced = img.width < res->imageWidth;
                         res->ok = true;
                     }
                 } else {

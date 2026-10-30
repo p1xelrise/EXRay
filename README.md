@@ -17,7 +17,9 @@ Photoshop. One small portable `.exe`, nothing to install, works fully offline.
 
 ## What it does
 
+- **Your folders in one place:** add HDRI and EXR folders from any drive, browse them as a tree, and search file names across all of them (Ctrl+F). EXRay remembers them and notices new files.
 - **Thumbnail grid** of a whole folder, made in the background. Handles 16K HDRIs and files over 2 GB.
+- **Inspector:** size, brightest value and range of the selected image, with quick actions.
 - **Image view** with exposure (−10 … +10 EV), Clip / Reinhard / ACES tonemaps, zoom, pan and arrow-key browsing.
 - **360° view** of equirectangular HDRIs: drag to look around, wheel for field of view.
 - **EXR layers**: multi-layer, multi-part and multi-view files; readable depth, normal and motion-vector views; the real stored values under the mouse.

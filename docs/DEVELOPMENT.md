@@ -35,13 +35,13 @@ motion vectors, Cryptomatte), and export what you need as PNG or JPEG.
 
 ## Coming next
 
-- **v0.10 — HDRI prep:** sun to light (direction, strength, colour for Unreal /
-  Blender); calibrate (light level in lux, scale to a measured value or a
-  preset, white balance from a grey spot, sRGB / ACEScg); remove the sun; rotate and level the horizon; batch resize (2K / 4K
-  / 8K) and convert between EXR and HDR.
-- **v0.11 — HDRI library:** favourites, tags, search; sort by brightness, sun
-  height or colour temperature; drag an HDRI into Unreal or Blender.
-- **v0.12 — Inspect:** histogram, false colour, chrome / grey ball preview,
+- **v0.11 — Smart library:** badges on thumbnails (clipped / real / low sun)
+  and filters for them; favourites, tags, recently opened; sort by brightness
+  or sun height.
+- **v0.12 — HDRI prep:** sun to light (direction, strength, colour for Unreal /
+  Blender); calibrate (lux, presets, white balance, sRGB / ACEScg); remove the
+  sun; rotate and level the horizon; batch resize and convert.
+- **v0.13 — Inspect:** histogram, false colour, chrome / grey ball preview,
   metadata panel.
 - **v1.0 — Launch:** A/B compare, final testing on a clean Windows 11 PC.
 - **Later:** File Explorer thumbnails (optional installer), ARM64, float TIFF /
@@ -67,7 +67,20 @@ public domain). Versions: [third_party/VERSIONS.txt](../third_party/VERSIONS.txt
 
 Made with ❤︎ from Greece — pixelrise@gmail.com
 
-## Status: v0.9.8 beta
+## Status: v0.10.0 beta
+
+- Studio layout: sidebar (src/side_panels.*: folder tree, search scope, + Add),
+  inspector, grid header with "Include subfolders"; Fix HDRI is a child panel
+  docked over the inspector (src/fix_window.*).
+- Folder library (src/library.*, platform independent, tests/library_test.cpp):
+  add / remove / undo, saved in EXRay.ini ([Library], [LibraryOpen]),
+  background scans (folders + file names), tree rows, search.
+- Folders are watched with FindFirstChangeNotification (one thread); changes
+  rescan the library and refresh the grid. Missing folders are re-checked every 10 s.
+- Brightest value and range per thumbnail (ImageQuickStats) and per opened image.
+- Horizon Sun app icon (tools/make_icon.py).
+
+### v0.9.8 beta
 
 - Open source: GNU GPL v3 or later, on GitHub (p1xelrise/EXRay). Help menu
   links to the source code and the support page; About and Licenses show the
@@ -290,6 +303,8 @@ scene lit by the real HDRI, a clipped copy and the fixed copy.
 - `src/info_window.*` – the Controls and shortcuts / About window
 - `src/pano.*`        – the 360° view renderer
 - `src/hdri_fix.*`    – Fix HDRI analysis and repairs (clipped sun, broken / hot pixels)
+- `src/library.*`     – folder library, scans, tree rows and search (portable)
+- `src/side_panels.*` – the sidebar and the inspector (custom drawn)
 - `src/fix_window.*`  – the Fix HDRI report window
 - `res/logo.bin`      – the logo for the About page (made by tools/make_logo.py)
 - `src/thumbnail.*` – thumbnails (area resample, compact RGBE storage)

@@ -20,6 +20,29 @@ namespace {
 constexpr wchar_t kView[] = L"View";
 constexpr wchar_t kExport[] = L"Export";
 constexpr wchar_t kWindow[] = L"Window";
+constexpr wchar_t kLibrary[] = L"Library";
+constexpr wchar_t kExpanded[] = L"LibraryOpen";
+constexpr int kMaxListed = 500;
+
+// A list kept as Count=N and 1=..., 2=... in its own section.
+std::vector<std::wstring> GetList(const std::wstring& ini, const wchar_t* section) {
+    std::vector<std::wstring> out;
+    const int n = std::clamp(static_cast<int>(GetPrivateProfileIntW(section, L"Count", 0, ini.c_str())), 0, kMaxListed);
+    for (int i = 1; i <= n; ++i) {
+        wchar_t buf[4096];
+        GetPrivateProfileStringW(section, std::to_wstring(i).c_str(), L"", buf, static_cast<DWORD>(std::size(buf)), ini.c_str());
+        if (buf[0]) out.push_back(buf);
+    }
+    return out;
+}
+
+void PutList(const std::wstring& ini, const wchar_t* section, const std::vector<std::wstring>& items) {
+    WritePrivateProfileStringW(section, nullptr, nullptr, ini.c_str());   // clear the old list
+    const size_t n = std::min(items.size(), static_cast<size_t>(kMaxListed));
+    WritePrivateProfileStringW(section, L"Count", std::to_wstring(n).c_str(), ini.c_str());
+    for (size_t i = 0; i < n; ++i)
+        WritePrivateProfileStringW(section, std::to_wstring(i + 1).c_str(), items[i].c_str(), ini.c_str());
+}
 
 std::wstring ExeFolder() {
     wchar_t buf[MAX_PATH * 4];
@@ -94,6 +117,12 @@ AppSettings LoadSettings() {
     const std::wstring fixed = Get(ini, kExport, L"FixedFormat");
     s.fixedFormat = fixed == L"exr16" ? 1 : fixed == L"hdr" ? 2 : 0;
 
+    s.libraryFolders = GetList(ini, kLibrary);
+    s.expandedFolders = GetList(ini, kExpanded);
+    s.lastFolder = Get(ini, kView, L"LastFolder");
+    s.showSidebar = GetInt(ini, kView, L"Sidebar", 1) != 0;
+    s.showInspector = GetInt(ini, kView, L"Inspector", 1) != 0;
+
     s.winW = GetInt(ini, kWindow, L"Width", 0);
     s.winH = GetInt(ini, kWindow, L"Height", 0);
     s.winX = GetInt(ini, kWindow, L"X", 0);
@@ -126,6 +155,12 @@ void SaveSettings(const AppSettings& s) {
     Put(ini, kExport, L"EveryLayer", s.exportEveryLayer ? L"1" : L"0");
     Put(ini, kExport, L"Look", s.exportLook == 1 ? L"aces" : s.exportLook == 2 ? L"shown" : L"clip");
     Put(ini, kExport, L"FixedFormat", s.fixedFormat == 1 ? L"exr16" : s.fixedFormat == 2 ? L"hdr" : L"exr32");
+
+    Put(ini, kView, L"LastFolder", s.lastFolder);
+    Put(ini, kView, L"Sidebar", s.showSidebar ? L"1" : L"0");
+    Put(ini, kView, L"Inspector", s.showInspector ? L"1" : L"0");
+    PutList(ini, kLibrary, s.libraryFolders);
+    PutList(ini, kExpanded, s.expandedFolders);
 
     if (s.hasWindow) {
         Put(ini, kWindow, L"X", std::to_wstring(s.winX));

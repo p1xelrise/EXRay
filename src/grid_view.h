@@ -35,6 +35,9 @@ struct GridItem {
     std::string format;
     std::string error;
     Thumbnail thumb;
+    float peakLum = -1.0f;         // from the thumbnail worker; -1 = not known yet
+    float rangeStops = 0.0f;
+    bool statsReduced = false;
 
     // Tonemapped copy for drawing; only kept for tiles on or near the screen.
     std::unique_ptr<Bitmap> bmp;

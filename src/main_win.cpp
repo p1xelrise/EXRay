@@ -1,7 +1,6 @@
-// EXRay (HDR & EXR viewer) — test tool
+// EXRay (HDR & EXR viewer) -- Windows viewer
 // Copyright (C) 2026 Giorgos Eleftheroglou (pixelrise)
 // SPDX-License-Identifier: GPL-3.0-or-later
-// EXRay (HDR & EXR viewer) -- Windows viewer
 //
 // Phase 2: exposure slider, tonemap choice, zoom & pan, and browsing the
 // other .hdr/.exr files in the same folder with the arrow keys.
@@ -11,6 +10,7 @@
 // v0.6: export look choice (Clip default), readable depth / normal / vector views.
 // v0.8: 360-degree view of equirectangular HDRIs.
 // v0.9: Fix HDRI (clipped sun, broken and hot pixels), saved as EXR or HDR.
+// v0.10: Studio layout: folder library sidebar, search, inspector, Fix HDRI docked.
 
 #ifndef UNICODE
 #define UNICODE
@@ -36,6 +36,9 @@
 #include <cwctype>
 #include <iterator>
 #include <memory>
+#include <map>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,9 +54,11 @@
 #include "hdri_fix.h"
 #include "image_io.h"
 #include "info_window.h"
+#include "library.h"
 #include "pano.h"
 #include "resample.h"
 #include "settings_win.h"
+#include "side_panels.h"
 #include "thumb_pool.h"
 #include "tonemap.h"
 #include "toolbar.h"
@@ -62,7 +67,7 @@ namespace {
 
 constexpr wchar_t kAppName[]   = L"EXRay";
 constexpr wchar_t kClassName[] = L"EXRayWindow";
-constexpr wchar_t kVersion[]   = L"0.9.8 beta";
+constexpr wchar_t kVersion[]   = L"0.10.0 beta";
 
 // Window titles: "EXRay \u2014 v0.9.2" on its own, and
 // "sky_04.exr \u2014 EXRay v0.9.2" with a file or folder open.
@@ -85,10 +90,15 @@ constexpr UINT WM_APP_BATCH_PROGRESS = WM_APP + 6;
 constexpr UINT WM_APP_BATCH_DONE     = WM_APP + 7;
 constexpr UINT WM_APP_ANALYZED  = WM_APP + 8;
 constexpr UINT WM_APP_FIXED     = WM_APP + 9;
+constexpr UINT WM_APP_SCANNED   = WM_APP + 10;   // a library folder was scanned
+constexpr UINT WM_APP_LIBCHANGED = WM_APP + 11;  // something changed in a library folder
 constexpr UINT_PTR kStatusTimer = 2;
 constexpr UINT_PTR kThumbSizeTimer = 3;
 constexpr UINT_PTR kPanoSharpTimer = 4;   // full-resolution 360 frame after moving stops   // re-make sharper thumbnails after a size change
 constexpr UINT_PTR kRenderTimer = 1;
+constexpr UINT_PTR kSearchTimer = 5;      // search a moment after typing stops
+constexpr UINT_PTR kLibraryTimer = 6;     // rescan a moment after files changed
+constexpr UINT_PTR kLibCheckTimer = 7;    // look for folders that were missing (unplugged drives)
 
 enum : UINT {
     IDM_OPEN = 101, IDM_OPEN_FOLDER, IDM_REFRESH, IDM_EXIT, IDM_ABOUT, IDM_SHORTCUTS,
@@ -100,6 +110,10 @@ enum : UINT {
     IDM_EXP_UP, IDM_EXP_DOWN, IDM_EXP_RESET,
     IDM_TM_CLIP, IDM_TM_REINHARD, IDM_TM_ACES, IDM_TM_CYCLE,
     IDM_FIX, IDM_FIX_COMPARE, IDM_SAVE_FIXED, IDM_SUN_CHECK, IDM_SOURCE, IDM_SUPPORT,
+    IDM_SPONSOR, IDM_ADD_FOLDER, IDM_FIND, IDM_TOGGLE_SIDEBAR, IDM_TOGGLE_INSPECTOR, IDM_UNDO_REMOVE,
+    IDM_SHOW_IN_EXPLORER,
+    // Folder menu in the sidebar
+    IDM_FOLDER_OPEN, IDM_FOLDER_EXPLORER, IDM_FOLDER_RESCAN, IDM_FOLDER_SUB, IDM_FOLDER_REMOVE,
     IDM_LAYER_BASE = 1000,   // + layer index, from the layer pop-up menu
 };
 
@@ -124,6 +138,7 @@ struct LoadResult {
     int layer = -1;
     unsigned imageId = 0;                    // for layer switches: which image this belongs to
     std::vector<uint32_t> isolate;           // Cryptomatte objects shown as a mask
+    float peakLum = -1.0f, rangeStops = 0.0f; // of the decoded image (-1 = not measured)
 };
 
 struct ExportResult {
@@ -141,13 +156,16 @@ struct RenderResult {
 
 // --- application state --------------------------------------------------------------
 
-enum class Drag { None, Pan, Slider, Button, Scroll, SizeSlider };
+enum class Drag { None, Pan, Slider, Button, Scroll, SizeSlider, Panel };
 enum class Mode { Single, Grid };
 
 struct App {
     HWND hwnd = nullptr;
     HFONT font = nullptr;
     HFONT bigFont = nullptr;
+    HFONT boldFont = nullptr;
+    HFONT smallFont = nullptr;
+    HFONT titleFont = nullptr;
     UINT dpi = 96;
     Toolbar toolbar;
 
@@ -285,6 +303,38 @@ struct App {
         double zoom = 1.0, cx = 0.0, cy = 0.0;
     } sunCheck;
     HdriFixResult fixResult;
+    HWND fixPanel = nullptr;         // Fix HDRI, docked over the inspector
+    bool fixPanelOn = false;
+
+    // Studio layout: folder library on the left, inspector on the right.
+    FolderLibrary library;
+    std::map<std::wstring, std::unique_ptr<ScanResult>> scans;   // by library folder (lower case); missing while scanning
+    std::vector<std::wstring> searchHitPaths;
+    std::set<std::wstring> expanded;                  // folders showing their subfolders (lower case)
+    std::vector<TreeRow> rows;                        // the tree as drawn
+    Sidebar sidebar;
+    SidebarHit sideHover;
+    Inspector inspector;
+    int inspHover = 0, inspPressed = 0;
+    bool gridSubfolders = false;     // the grid shows the files of subfolders too
+    // A thumbnail of the selected file for the inspector (grid tiles free theirs when off screen).
+    std::unique_ptr<Bitmap> inspBmp;
+    std::wstring inspBmpPath;
+    TonemapSettings inspBmpSettings;
+    // Brightest value and range of the image on screen (measured once per image).
+    const HdrImage* statsFor = nullptr;
+    float imagePeak = 0.0f, imageRange = 0.0f;
+
+    // Search (the box at the top of the sidebar).
+    HWND searchEdit = nullptr;
+    WNDPROC searchEditProc = nullptr;
+    HBRUSH editBrush = nullptr;
+    bool searchActive = false;       // the grid shows search results
+    bool searchAll = true;           // all library folders, else the folder that was showing
+    std::wstring searchQuery;
+    std::wstring searchFolder;       // the folder showing when the search started
+    std::vector<int> rowMatches;     // matches per tree row
+    size_t searchHits = 0;
 } g;
 
 // --- small helpers -------------------------------------------------------------------
@@ -304,11 +354,21 @@ bool HasImage() { return g.image && !g.image->empty(); }
 constexpr wchar_t kDownloadPage[] = L"https://p1xelrise.gumroad.com/l/exray";
 // The source code (GNU GPL v3 or later).
 constexpr wchar_t kSourcePage[] = L"https://github.com/p1xelrise/EXRay";
+constexpr wchar_t kSponsorPage[] = L"https://github.com/sponsors/p1xelrise";
 bool CtrlDown() { return (GetKeyState(VK_CONTROL) & 0x8000) != 0; }
+
+HFONT UiFont(int px, int weight) {
+    return CreateFontW(-Scale(px), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                       CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+}
 
 void RecreateFonts() {
     if (g.font) DeleteObject(g.font);
     if (g.bigFont) DeleteObject(g.bigFont);
+    for (HFONT* f : {&g.boldFont, &g.smallFont, &g.titleFont}) if (*f) DeleteObject(*f);
+    g.boldFont = UiFont(13, FW_SEMIBOLD);
+    g.smallFont = UiFont(12, FW_NORMAL);
+    g.titleFont = UiFont(15, FW_SEMIBOLD);
     g.font = CreateFontW(-Scale(13), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                          DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
@@ -321,10 +381,53 @@ int InfoBarHeight() { return Scale(28); }
 
 RECT ClientRect() { RECT r; GetClientRect(g.hwnd, &r); return r; }
 
-RECT Viewport() {
+// Between the toolbar and the info bar, across the whole width.
+RECT MiddleRect() {
     RECT r = ClientRect();
     r.top = std::min<LONG>(r.bottom, g.toolbar.Height());
     r.bottom = std::max(r.top, r.bottom - InfoBarHeight());
+    return r;
+}
+
+// The side panels give way on narrow windows so the image keeps room.
+int MinContentWidth() { return Scale(440); }
+bool SidebarShown() {
+    const RECT m = MiddleRect();
+    return g.cfg.showSidebar && (m.right - m.left) - Sidebar::Width(g.dpi) >= MinContentWidth();
+}
+bool InspectorShown() {
+    const RECT m = MiddleRect();
+    const int side = SidebarShown() ? Sidebar::Width(g.dpi) : 0;
+    const bool room = (m.right - m.left) - side - Inspector::Width(g.dpi) >= MinContentWidth();
+    return (g.cfg.showInspector || g.fixPanelOn) && (room || g.fixPanelOn);
+}
+RECT SidebarRect() {
+    RECT r = MiddleRect();
+    r.right = SidebarShown() ? r.left + Sidebar::Width(g.dpi) : r.left;
+    return r;
+}
+RECT InspectorRect() {
+    RECT r = MiddleRect();
+    r.left = InspectorShown() ? std::max<LONG>(SidebarRect().right, r.right - Inspector::Width(g.dpi)) : r.right;
+    return r;
+}
+// Grid or image area.
+RECT ContentRect() {
+    RECT r = MiddleRect();
+    r.left = SidebarRect().right;
+    r.right = std::max(r.left, InspectorRect().left);
+    return r;
+}
+int GridHeaderHeight() { return Scale(40); }
+RECT GridHeaderRect() {
+    RECT r = ContentRect();
+    r.bottom = std::min<LONG>(r.bottom, r.top + GridHeaderHeight());
+    return r;
+}
+
+RECT Viewport() {
+    RECT r = ContentRect();
+    if (g.mode == Mode::Grid) r.top = std::min(r.bottom, GridHeaderRect().bottom);
     return r;
 }
 
@@ -559,6 +662,7 @@ void LaunchLoad(const std::wstring& path) {
             }   // file bytes freed here
             if (res->ok) {
                 res->layer = res->doc ? res->doc->DefaultLayer() : -1;
+                ImageQuickStats(*img, res->peakLum, res->rangeStops);
                 PrepareDisplay(*res, std::move(img), settings);
             }
         } catch (const std::bad_alloc&) {
@@ -576,6 +680,7 @@ void LaunchLoad(const std::wstring& path) {
 }
 
 bool ConfirmDiscardFix();
+void CloseFixPanel();
 
 void StartLoad(const std::wstring& path) {
     if (!ConfirmDiscardFix()) return;
@@ -630,7 +735,11 @@ void OnLoaded(LoadResult* raw) {
     ++g.imageId;
     g.path = res->path;
     ClearFix();
+    CloseFixPanel();   // the report was for the previous image
     InstallImage(*res);
+    g.statsFor = g.image.get();
+    g.imagePeak = res->peakLum;
+    g.imageRange = res->rangeStops;
     g.loadSeconds = res->seconds;
     g.doc = std::move(res->doc);
     g.layer = res->layer;
@@ -1265,16 +1374,40 @@ void LaunchFixDisplay(std::shared_ptr<const HdrImage> source, bool compare, bool
 
 void ToggleSunCheck(bool haveSun = false, double sunX = 0.0, double sunY = 0.0);
 
+void OnResize();
+
+// Fix HDRI opens as a panel over the inspector; the image stays in view.
 void ShowFixDialog() {
-    HdriFixOptions opts = g.fixOptsValid ? g.fixOpts : DefaultFixOptions(g.fixReport);
-    const FixWindowResult result = ShowFixWindow(g.hwnd, FileNameOf(g.path), g.fixReport, opts);
-    if (result == FixWindowResult::Cancel) return;
+    if (!g.fixPanel) return;
+    const HdriFixOptions opts = g.fixOptsValid ? g.fixOpts : DefaultFixOptions(g.fixReport);
+    FixPanelShow(g.fixPanel, FileNameOf(g.path), g.fixReport, opts);
+    g.fixPanelOn = true;
+    OnResize();   // places and shows the panel, and narrows the image area if needed
+}
+
+void CloseFixPanel() {
+    if (!g.fixPanelOn) return;
+    if (g.fixPanel) {
+        if (!g.fixReportFor.expired()) { g.fixOpts = FixPanelOptions(g.fixPanel); g.fixOptsValid = true; }
+        ShowWindow(g.fixPanel, SW_HIDE);
+    }
+    g.fixPanelOn = false;
+    if (g.hwnd) OnResize();
+}
+
+// A footer button of the panel (WM_APP_FIXPANEL).
+void OnFixPanel(FixWindowResult result) {
+    if (!g.fixPanelOn) return;
+    if (result == FixWindowResult::Cancel) { CloseFixPanel(); return; }
+    if (g.fixReportFor.expired()) { CloseFixPanel(); return; }   // the image changed meanwhile
+    const HdriFixOptions opts = FixPanelOptions(g.fixPanel);
     g.fixOpts = opts;
     g.fixOptsValid = true;
     if (result == FixWindowResult::SunCheck) {
-        if (!g.sunCheck.on) ToggleSunCheck(true, g.fixReport.sunX, g.fixReport.sunY);
+        ToggleSunCheck(true, g.fixReport.sunX, g.fixReport.sunY);   // again: back to the normal view
         return;
     }
+    if (g.fixBusy) { MessageBeep(MB_OK); return; }
     LaunchFixDisplay(FixActive() ? g.fixOriginal : g.image, false, false, opts);
 }
 
@@ -1595,6 +1728,7 @@ void Navigate(Nav where) {
 // --- folder grid ------------------------------------------------------------------------------
 
 void SetGridTitle() {
+    if (g.searchActive) { SetWindowTextW(g.hwnd, TitleFor(L"Search: " + g.searchQuery).c_str()); return; }
     std::wstring name = FileNameOf(g.gridFolder);
     if (name.empty()) name = g.gridFolder;
     SetWindowTextW(g.hwnd, TitleFor(name).c_str());
@@ -1641,17 +1775,77 @@ void PickAll() {
     Redraw();
 }
 
-// Shows the grid for `folder`. Thumbnails already made for unchanged files
-// are kept; new or changed files are queued. `select` picks the tile to highlight.
-void OpenFolder(std::wstring folder, const std::wstring& select) {
-    while (folder.size() > 3 && (folder.back() == L'\\' || folder.back() == L'/')) folder.pop_back();
-    if (folder.size() == 3 && folder[1] == L':') folder.pop_back();   // "D:\" -> "D:"
+// Size and date of one file (for search results, which come from different folders).
+FileEntry EntryFor(const std::wstring& path) {
+    FileEntry e;
+    e.path = path;
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa)) {
+        e.size = (static_cast<uint64_t>(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow;
+        e.writeTime = (static_cast<uint64_t>(fa.ftLastWriteTime.dwHighDateTime) << 32) | fa.ftLastWriteTime.dwLowDateTime;
+    }
+    return e;
+}
 
-    const bool sameFolder = !g.gridFolder.empty() && SamePath(folder, g.gridFolder);
+// The scan of the library folder that contains `folder` (null if none, or not scanned yet).
+std::wstring PathKey(const std::wstring& path) {
+    std::wstring k = NormalizeFolderPath(path);
+    for (auto& c : k) c = static_cast<wchar_t>(std::towlower(c));
+    return k;
+}
+
+const ScanResult* ScanOf(const std::wstring& libraryFolder) {
+    auto it = g.scans.find(PathKey(libraryFolder));
+    return it == g.scans.end() ? nullptr : it->second.get();
+}
+
+// Scans in library order (null while a folder is being scanned).
+std::vector<const ScanResult*> LibraryScans() {
+    std::vector<const ScanResult*> v;
+    for (const auto& f : g.library.Folders()) v.push_back(ScanOf(f.path));
+    return v;
+}
+
+const ScanResult* ScanFor(const std::wstring& folder) {
+    const int root = g.library.RootOf(folder);
+    if (root < 0) return nullptr;
+    const ScanResult* sc = ScanOf(g.library.Folders()[static_cast<size_t>(root)].path);
+    return sc && !sc->missing ? sc : nullptr;
+}
+
+// "Include subfolders" belongs to the library folder a folder is in.
+bool SubfoldersFor(const std::wstring& folder) {
+    const int root = g.library.RootOf(folder);
+    return root >= 0 && g.library.Folders()[static_cast<size_t>(root)].subfolders;
+}
+
+// The files of `folder`, read now (sizes and dates fresh); with its
+// subfolders, in the order of the folder tree.
+std::vector<FileEntry> ListFolderEntries(const std::wstring& folder, bool subfolders) {
+    std::vector<FileEntry> entries = ListHdrFileEntries(folder);
+    if (!subfolders) return entries;
+    const ScanResult* sc = ScanFor(folder);
+    const int start = sc ? sc->Find(folder) : -1;
+    if (start < 0) return entries;
+    std::vector<int> stack(sc->folders[static_cast<size_t>(start)].children.rbegin(),
+                           sc->folders[static_cast<size_t>(start)].children.rend());
+    while (!stack.empty() && entries.size() < 20000) {
+        const ScannedFolder& f = sc->folders[static_cast<size_t>(stack.back())];
+        stack.pop_back();
+        for (auto& e : ListHdrFileEntries(f.path)) entries.push_back(std::move(e));
+        for (auto c = f.children.rbegin(); c != f.children.rend(); ++c) stack.push_back(*c);
+    }
+    return entries;
+}
+
+// Shows `entries` in the grid. Thumbnails already made for unchanged files
+// are kept (when `sameListing`, i.e. a refresh); new or changed files are
+// queued. `select` picks the tile to highlight.
+void ShowEntries(std::vector<FileEntry> entries, bool sameListing, const std::wstring& select) {
+    const bool sameFolder = sameListing;
     const std::wstring keepSelection = (g.selected >= 0 && g.selected < static_cast<int>(g.items.size()))
                                        ? g.items[static_cast<size_t>(g.selected)].path : std::wstring();
 
-    std::vector<FileEntry> entries = ListHdrFileEntries(folder);
     std::vector<GridItem> fresh;
     fresh.reserve(entries.size());
     std::vector<unsigned char> done(entries.size(), 0);
@@ -1684,7 +1878,7 @@ void OpenFolder(std::wstring folder, const std::wstring& select) {
     }
 
     if (!unchanged) {
-        // Unchanged folders keep their running jobs; otherwise start a new list.
+        // Unchanged listings keep their running jobs; otherwise start a new list.
         g.items = std::move(fresh);
         ++g.gridGen;
         std::vector<PathString> paths;
@@ -1698,17 +1892,17 @@ void OpenFolder(std::wstring folder, const std::wstring& select) {
     }
 
     if (!sameFolder) g.grid.ScrollTo(0);
-    g.gridFolder = folder;
     g.mode = Mode::Grid;
     g.gridHover = -1;
     KillTimer(g.hwnd, kRenderTimer);
+    CloseFixPanel();
 
     int sel = select.empty() ? -1 : GridIndexOf(select);
     if (sel < 0 && sameFolder && !keepSelection.empty()) sel = GridIndexOf(keepSelection);
     if (sel < 0) sel = 0;
     g.selected = g.items.empty() ? -1 : sel;
     // Coming back from an image, or a new folder: just that tile is selected.
-    // Refreshing the same folder keeps a multi-selection.
+    // Refreshing the same listing keeps a multi-selection.
     bool anyPicked = false;
     for (const auto& it : g.items) anyPicked |= it.picked;
     if (!select.empty() || !sameFolder || !anyPicked) PickOnly(g.selected);
@@ -1718,10 +1912,40 @@ void OpenFolder(std::wstring folder, const std::wstring& select) {
     Redraw();
 }
 
+void EndSearch(bool reopen);
+void RefreshTree();
+void SaveLibrary();
+
+// Shows the grid for `folder` (with its subfolders when its library folder says so).
+void OpenFolder(std::wstring folder, const std::wstring& select) {
+    while (folder.size() > 3 && (folder.back() == L'\\' || folder.back() == L'/')) folder.pop_back();
+    if (folder.size() == 3 && folder[1] == L':') folder.pop_back();   // "D:\" -> "D:"
+
+    if (g.searchActive) EndSearch(false);
+    const bool sub = SubfoldersFor(folder);
+    const bool sameFolder = !g.gridFolder.empty() && SamePath(folder, g.gridFolder) && sub == g.gridSubfolders;
+    g.gridFolder = folder;
+    g.gridSubfolders = sub;
+    ShowEntries(ListFolderEntries(folder, sub), sameFolder, select);
+    if (!SamePath(g.cfg.lastFolder, folder)) { g.cfg.lastFolder = folder; SaveLibrary(); }
+    RefreshTree();
+}
+
 // From the single image to the grid of its folder.
 void ShowGrid() {
     const std::wstring target = TargetPath();
     if (g.mode == Mode::Grid) return;
+    if (g.searchActive && !g.items.empty()) {   // back to the search results
+        g.mode = Mode::Grid;
+        CloseFixPanel();
+        const int i = GridIndexOf(target);
+        if (i >= 0) { g.selected = i; PickOnly(i); }
+        LayoutGrid();
+        if (g.selected >= 0) g.grid.EnsureVisible(g.selected);
+        SetGridTitle();
+        Redraw();
+        return;
+    }
     if (target.empty()) {
         if (!g.gridFolder.empty()) OpenFolder(g.gridFolder, L"");
         return;
@@ -1764,7 +1988,12 @@ void OnThumb(ThumbResult* raw) {
     it.format = res->format;
     it.error = res->error;
     it.thumb = std::move(res->thumb);
+    it.peakLum = res->ok ? res->peakLum : -1.0f;
+    it.rangeStops = res->rangeStops;
+    it.statsReduced = res->statsReduced;
     it.bmp.reset();
+    if (SamePath(g.inspBmpPath, it.path)) g.inspBmpPath.clear();   // a sharper thumbnail for the inspector too
+    if (res->index == g.selected && InspectorShown()) { RECT ir = InspectorRect(); InvalidateRect(g.hwnd, &ir, FALSE); }
     if (g.mode == Mode::Grid) {
         RECT r = g.grid.ItemRect(res->index);
         RECT vp = Viewport();
@@ -1860,6 +2089,358 @@ void OpenPath(const std::wstring& path) {
         g.mode = Mode::Single;
         StartLoad(path);
     }
+}
+
+// --- folder library (sidebar) -------------------------------------------------------------
+
+void SaveLibrary() {
+    g.cfg.libraryFolders = g.library.Save();
+    g.cfg.expandedFolders.assign(g.expanded.begin(), g.expanded.end());
+    SaveSettings(g.cfg);
+}
+
+bool IsExpanded(const std::wstring& path) { return g.expanded.count(PathKey(path)) > 0; }
+
+void RunSearch();
+void InvalidateInfoBar();
+
+// Scans a library folder in the background (subfolders and file names).
+struct ScanDone {
+    std::wstring root;
+    ScanResult result;
+};
+
+void StartScan(const std::wstring& root) {
+    HWND hwnd = g.hwnd;
+    std::thread([hwnd, root]() {
+        auto r = std::make_unique<ScanDone>();
+        r->root = root;
+        r->result = ScanFolderTree(root);
+        if (PostMessageW(hwnd, WM_APP_SCANNED, 0, reinterpret_cast<LPARAM>(r.get()))) r.release();
+    }).detach();
+}
+
+void ScanAll() {
+    for (const auto& f : g.library.Folders()) StartScan(f.path);
+}
+
+// Watches the library folders for new, changed and removed files (one
+// thread for all, woken up when the list of folders changes).
+struct Watcher {
+    std::mutex mu;
+    std::vector<std::wstring> roots;
+    HANDLE wake = nullptr;
+} watcher;
+
+void WatcherLoop(HWND hwnd) {
+    for (;;) {
+        std::vector<std::wstring> roots;
+        { std::lock_guard<std::mutex> lock(watcher.mu); roots = watcher.roots; }
+        std::vector<HANDLE> hs{watcher.wake};
+        for (const auto& r : roots) {
+            if (hs.size() >= MAXIMUM_WAIT_OBJECTS) break;
+            std::wstring p = r;
+            if (p.size() == 2 && p[1] == L':') p += L'\\';
+            HANDLE h = FindFirstChangeNotificationW(p.c_str(), TRUE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                                                                     FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
+            if (h != INVALID_HANDLE_VALUE) hs.push_back(h);
+        }
+        for (;;) {
+            const DWORD w = WaitForMultipleObjects(static_cast<DWORD>(hs.size()), hs.data(), FALSE, INFINITE);
+            if (w == WAIT_OBJECT_0) break;   // the list of folders changed
+            if (w > WAIT_OBJECT_0 && w < WAIT_OBJECT_0 + hs.size()) {
+                PostMessageW(hwnd, WM_APP_LIBCHANGED, 0, 0);
+                Sleep(300);   // a copy of many files: one message per moment is enough
+                if (!FindNextChangeNotification(hs[w - WAIT_OBJECT_0])) break;
+            } else {
+                Sleep(1000);
+                break;
+            }
+        }
+        for (size_t i = 1; i < hs.size(); ++i) FindCloseChangeNotification(hs[i]);
+    }
+}
+
+void RestartWatcher() {
+    {
+        std::lock_guard<std::mutex> lock(watcher.mu);
+        watcher.roots.clear();
+        for (const auto& f : g.library.Folders()) watcher.roots.push_back(f.path);
+    }
+    if (!watcher.wake) {
+        watcher.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!watcher.wake) return;
+        std::thread(WatcherLoop, g.hwnd).detach();
+    } else {
+        SetEvent(watcher.wake);
+    }
+}
+
+// Rebuilds the tree rows (and the search matches per row) and redraws the sidebar.
+void RefreshTree() {
+    g.rows = BuildTreeRows(g.library, LibraryScans(), IsExpanded);
+    g.rowMatches.clear();
+    if (g.searchActive) {
+        g.rowMatches.assign(g.rows.size(), 0);
+        for (size_t r = 0; r < g.rows.size(); ++r)
+            for (const auto& hp : g.searchHitPaths)
+                if (IsInsideFolder(hp, g.rows[r].path)) ++g.rowMatches[r];
+    }
+    g.sidebar.Layout(SidebarRect(), g.dpi, static_cast<int>(g.rows.size()));
+    if (g.hwnd) { RECT r = SidebarRect(); InvalidateRect(g.hwnd, &r, FALSE); }
+}
+
+int CurrentRow() {
+    const std::wstring folder = g.mode == Mode::Grid ? (g.searchActive ? std::wstring() : g.gridFolder) : FolderOf(TargetPath());
+    if (folder.empty()) return -1;
+    for (size_t i = 0; i < g.rows.size(); ++i)
+        if (SamePathNoCase(g.rows[i].path, folder)) return static_cast<int>(i);
+    return -1;
+}
+
+std::wstring LibraryStatus() {
+    if (g.library.Size() == 0) return {};
+    int files = 0, scanning = 0, missing = 0;
+    for (const auto& f : g.library.Folders()) {
+        const ScanResult* sc = ScanOf(f.path);
+        if (!sc) ++scanning;
+        else if (sc->missing) ++missing;
+        else if (!sc->folders.empty()) files += sc->folders[0].total;
+    }
+    wchar_t buf[160];
+    const int n = static_cast<int>(g.library.Size());
+    std::swprintf(buf, std::size(buf), L"%d %ls · %d %ls", files, files == 1 ? L"file" : L"files", n, n == 1 ? L"folder" : L"folders");
+    std::wstring t = buf;
+    if (scanning) t = L"Reading folders…  " + t;
+    if (missing) t += L" · " + std::to_wstring(missing) + L" not found";
+    return t;
+}
+
+void OnScanned(ScanDone* raw) {
+    std::unique_ptr<ScanDone> res(raw);
+    if (g.library.IndexOf(res->root) < 0) return;   // removed meanwhile
+    g.scans[PathKey(res->root)] = std::make_unique<ScanResult>(std::move(res->result));
+    RefreshTree();
+    if (g.searchActive) RunSearch();
+    // A grid that includes subfolders needed this scan to list them.
+    else if (g.mode == Mode::Grid && g.gridSubfolders && IsInsideFolder(g.gridFolder, res->root) && g.drag == Drag::None)
+        OpenFolder(g.gridFolder, L"");
+    InvalidateInfoBar();
+}
+
+// Something changed on disk in a library folder: rescan, and refresh the grid if it shows a folder.
+void OnLibraryChanged() {
+    KillTimer(g.hwnd, kLibraryTimer);
+    ScanAll();
+    if (g.mode == Mode::Grid && !g.searchActive && !g.gridFolder.empty() && !g.batchBusy && g.drag == Drag::None)
+        OpenFolder(g.gridFolder, L"");
+}
+
+// Folders that were missing (an unplugged drive) are looked for again now and then.
+void CheckMissingFolders() {
+    bool back = false;
+    for (const auto& f : g.library.Folders()) {
+        const ScanResult* sc = ScanOf(f.path);
+        if (!sc || !sc->missing) continue;
+        std::wstring p = f.path;
+        if (p.size() == 2 && p[1] == L':') p += L'\\';
+        const DWORD a = GetFileAttributesW(p.c_str());
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) { StartScan(f.path); back = true; }
+    }
+    if (back) RestartWatcher();
+}
+
+void AddLibraryFolder(const std::wstring& path) {
+    const size_t before = g.library.Size();
+    const int i = g.library.Add(path);
+    if (i < 0) return;
+    const std::wstring& added = g.library.Folders()[static_cast<size_t>(i)].path;
+    if (g.library.Size() > before) {
+        g.expanded.insert(PathKey(added));
+        SaveLibrary();
+        StartScan(added);
+        RestartWatcher();
+        SetStatus(L"Added " + LeafName(added) + L" to the library");
+    }
+    RefreshTree();
+    OpenFolder(added, L"");
+}
+
+std::wstring PickFolder(const wchar_t* title) {
+    std::wstring out;
+    IFileOpenDialog* dlg = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return out;
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    dlg->SetTitle(title);
+    if (SUCCEEDED(dlg->Show(g.hwnd))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dlg->GetResult(&item))) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) { out = path; CoTaskMemFree(path); }
+            item->Release();
+        }
+    }
+    dlg->Release();
+    return out;
+}
+
+void ShowAddFolderDialog() {
+    const std::wstring path = PickFolder(L"Add a folder to the EXRay library");
+    if (!path.empty()) AddLibraryFolder(path);
+}
+
+// Takes a folder off the list. The folder and its files stay on the disk.
+void RemoveLibraryFolder(int index) {
+    if (index < 0 || index >= static_cast<int>(g.library.Size())) return;
+    const std::wstring path = g.library.Folders()[static_cast<size_t>(index)].path;
+    const std::wstring msg = L"Remove “" + path + L"” from EXRay?\n\nOnly the link in EXRay is removed: the folder "
+                             L"and its files stay on your disk. Ctrl+Z brings it back.";
+    if (MessageBoxW(g.hwnd, msg.c_str(), kAppName, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
+    g.library.Remove(static_cast<size_t>(index));
+    g.scans.erase(PathKey(path));
+    SaveLibrary();
+    RestartWatcher();
+    RefreshTree();
+    if (g.searchActive) RunSearch();
+    SetStatus(L"Removed " + LeafName(path) + L" from the library — Ctrl+Z brings it back");
+}
+
+void UndoRemoveFolder() {
+    if (!g.library.CanUndo()) { MessageBeep(MB_OK); return; }
+    const std::wstring path = g.library.UndoPath();
+    if (!g.library.Undo()) { MessageBeep(MB_OK); return; }
+    SaveLibrary();
+    StartScan(path);
+    RestartWatcher();
+    RefreshTree();
+    SetStatus(LeafName(path) + L" is back in the library");
+}
+
+void ToggleExpanded(const std::wstring& path) {
+    const std::wstring k = PathKey(path);
+    if (!g.expanded.erase(k)) g.expanded.insert(k);
+    SaveLibrary();
+    RefreshTree();
+}
+
+void SetLibrarySubfolders(int index, bool on) {
+    if (index < 0 || index >= static_cast<int>(g.library.Size())) return;
+    g.library.SetSubfolders(static_cast<size_t>(index), on);
+    SaveLibrary();
+    const std::wstring root = g.library.Folders()[static_cast<size_t>(index)].path;
+    if (g.mode == Mode::Grid && !g.searchActive && IsInsideFolder(g.gridFolder, root)) OpenFolder(g.gridFolder, L"");
+}
+
+void ShowInExplorer(const std::wstring& path, bool select) {
+    if (path.empty()) return;
+    const std::wstring args = select ? L"/select,\"" + path + L"\"" : L"\"" + path + L"\"";
+    ShellExecuteW(g.hwnd, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+// The right-click menu of a folder in the sidebar.
+void ShowFolderMenu(int row, POINT client) {
+    if (row < 0 || row >= static_cast<int>(g.rows.size())) return;
+    const TreeRow r = g.rows[static_cast<size_t>(row)];
+    const bool isRoot = r.depth == 0;
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING | (r.missing ? MF_GRAYED : 0), IDM_FOLDER_OPEN, L"&Open");
+    AppendMenuW(m, MF_STRING | (r.missing ? MF_GRAYED : 0), IDM_FOLDER_EXPLORER, L"Show in &Explorer");
+    AppendMenuW(m, MF_STRING, IDM_FOLDER_RESCAN, L"&Rescan now");
+    if (isRoot) {
+        const bool sub = g.library.Folders()[static_cast<size_t>(r.root)].subfolders;
+        AppendMenuW(m, MF_STRING | (sub ? MF_CHECKED : 0), IDM_FOLDER_SUB, L"Include &subfolders");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, IDM_FOLDER_REMOVE, L"Re&move from EXRay…  (files stay on disk)");
+    }
+    POINT pt = client;
+    ClientToScreen(g.hwnd, &pt);
+    const UINT cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, g.hwnd, nullptr);
+    DestroyMenu(m);
+    switch (cmd) {
+        case IDM_FOLDER_OPEN: OpenFolder(r.path, L""); break;
+        case IDM_FOLDER_EXPLORER: ShowInExplorer(r.path, false); break;
+        case IDM_FOLDER_RESCAN: StartScan(g.library.Folders()[static_cast<size_t>(r.root)].path); break;
+        case IDM_FOLDER_SUB: SetLibrarySubfolders(r.root, !g.library.Folders()[static_cast<size_t>(r.root)].subfolders); break;
+        case IDM_FOLDER_REMOVE: RemoveLibraryFolder(r.root); break;
+    }
+}
+
+// --- search ---------------------------------------------------------------------------------
+
+std::wstring SearchText() {
+    if (!g.searchEdit) return {};
+    const int n = GetWindowTextLengthW(g.searchEdit);
+    std::wstring t(static_cast<size_t>(n) + 1, L'\0');
+    GetWindowTextW(g.searchEdit, t.data(), n + 1);
+    t.resize(static_cast<size_t>(n));
+    const size_t a = t.find_first_not_of(L" \t"), b = t.find_last_not_of(L" \t");
+    return a == std::wstring::npos ? std::wstring() : t.substr(a, b - a + 1);
+}
+
+// Searches file names in the library (or the folder that was showing) and shows the matches in the grid.
+void RunSearch() {
+    KillTimer(g.hwnd, kSearchTimer);
+    const std::wstring q = SearchText();
+    if (q.empty()) { EndSearch(true); return; }
+    if (!g.searchActive) g.searchFolder = g.mode == Mode::Grid ? g.gridFolder : FolderOf(TargetPath());
+
+    std::vector<const ScanResult*> scans = LibraryScans();
+    std::unique_ptr<ScanResult> local;
+    std::wstring within = (!g.searchAll && !g.searchFolder.empty()) ? g.searchFolder : std::wstring();
+    if ((!within.empty() && !ScanFor(within)) || (within.empty() && g.library.Size() == 0 && !g.searchFolder.empty())) {
+        // A folder that isn't in the library: read it (and its subfolders) now.
+        if (within.empty()) within = g.searchFolder;
+        local = std::make_unique<ScanResult>(ScanFolderTree(within, 2000, 6));
+        scans = {local.get()};
+    }
+    const std::vector<SearchHit> hits = SearchLibrary(scans, q, within, 5000);
+    std::vector<FileEntry> entries;
+    entries.reserve(hits.size());
+    g.searchHitPaths.clear();
+    for (const auto& h : hits) { entries.push_back(EntryFor(h.path)); g.searchHitPaths.push_back(h.path); }
+    const bool same = g.searchActive;
+    g.searchActive = true;
+    g.searchQuery = q;
+    g.searchHits = hits.size();
+    // Thumbnails already made (in the folder grid or the last search) are reused.
+    if (!same) for (auto& it : g.items) it.picked = false;   // a new search starts with one selected
+    ShowEntries(std::move(entries), true, L"");
+    if (!same) { g.grid.ScrollTo(0); Redraw(); }
+    RefreshTree();
+}
+
+void EndSearch(bool reopen) {
+    KillTimer(g.hwnd, kSearchTimer);
+    if (!g.searchActive) return;
+    g.searchActive = false;
+    g.searchQuery.clear();
+    g.searchHitPaths.clear();
+    if (g.searchEdit && GetWindowTextLengthW(g.searchEdit) > 0) SetWindowTextW(g.searchEdit, L"");
+    KillTimer(g.hwnd, kSearchTimer);   // SetWindowText above started it again
+    const std::wstring back = g.searchFolder;
+    g.searchFolder.clear();
+    if (reopen && !back.empty()) OpenFolder(back, L"");
+    else if (reopen) { g.items.clear(); ++g.gridGen; g.selected = -1; SetGridTitle(); Redraw(); }
+    RefreshTree();
+}
+
+void FocusSearch() {
+    if (!g.searchEdit) return;
+    if (!SidebarShown()) { g.cfg.showSidebar = true; OnResize(); }
+    if (!SidebarShown()) { MessageBeep(MB_OK); return; }   // the window is too narrow for the sidebar
+    SetFocus(g.searchEdit);
+    SendMessageW(g.searchEdit, EM_SETSEL, 0, -1);
+}
+
+LRESULT CALLBACK SearchEditProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN) {
+        if (wp == VK_ESCAPE) { SetWindowTextW(h, L""); EndSearch(true); SetFocus(g.hwnd); return 0; }
+        if (wp == VK_RETURN || wp == VK_DOWN) { RunSearch(); SetFocus(g.hwnd); return 0; }
+    }
+    if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;   // no beep
+    return CallWindowProcW(g.searchEditProc, h, msg, wp, lp);
 }
 
 // --- drawing ---------------------------------------------------------------------------------
@@ -2280,6 +2861,225 @@ void DrawInfoBar(HDC dc, const RECT& bar) {
     DrawInfoText(dc, bar, left, right, chip);
 }
 
+// --- side panels ----------------------------------------------------------------------------
+
+PanelFonts MakePanelFonts() { return PanelFonts{g.font, g.boldFont, g.smallFont, g.titleFont}; }
+
+SidebarState MakeSidebarState() {
+    SidebarState st;
+    st.rows = &g.rows;
+    st.current = CurrentRow();
+    st.searching = g.searchActive;
+    st.matches = g.rowMatches;
+    st.scopeAll = g.searchAll;
+    st.scopeThisEnabled = !(g.searchActive ? g.searchFolder : (g.mode == Mode::Grid ? g.gridFolder : FolderOf(TargetPath()))).empty();
+    st.status = LibraryStatus();
+    st.hover = g.sideHover;
+    return st;
+}
+
+// "104 MB", "850 KB".
+std::wstring FormatBytes(uint64_t b) {
+    wchar_t buf[32];
+    if (b >= 1000ull * 1000 * 1000) std::swprintf(buf, std::size(buf), L"%.1f GB", b / 1e9);
+    else if (b >= 1000ull * 1000) std::swprintf(buf, std::size(buf), L"%.0f MB", b / 1e6);
+    else std::swprintf(buf, std::size(buf), L"%.0f KB", std::max(1.0, b / 1e3));
+    return buf;
+}
+
+// A file time as a local date: "29 Oct 2026, 14:13".
+std::wstring FormatFileTime(uint64_t t) {
+    if (!t) return {};
+    FILETIME ft{static_cast<DWORD>(t & 0xffffffffu), static_cast<DWORD>(t >> 32)}, local;
+    SYSTEMTIME st;
+    if (!FileTimeToLocalFileTime(&ft, &local) || !FileTimeToSystemTime(&local, &st)) return {};
+    static const wchar_t* months[] = {L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun", L"Jul", L"Aug", L"Sep", L"Oct", L"Nov", L"Dec"};
+    wchar_t buf[64];
+    std::swprintf(buf, std::size(buf), L"%u %ls %u, %02u:%02u", st.wDay, months[(st.wMonth + 11) % 12], st.wYear, st.wHour, st.wMinute);
+    return buf;
+}
+
+// 85479.2 -> "85,479"; small values keep decimals.
+std::wstring BigNumber(float v) {
+    wchar_t buf[48];
+    if (v < 10.0f) { std::swprintf(buf, std::size(buf), L"%.2f", static_cast<double>(v)); return buf; }
+    if (v < 1000.0f) { std::swprintf(buf, std::size(buf), L"%.1f", static_cast<double>(v)); return buf; }
+    std::swprintf(buf, std::size(buf), L"%.0f", static_cast<double>(v));
+    std::wstring t = buf, out;
+    for (size_t i = 0; i < t.size(); ++i) {
+        out += t[i];
+        const size_t left = t.size() - 1 - i;
+        if (left > 0 && left % 3 == 0) out += L',';
+    }
+    return out;
+}
+
+void AddBrightnessStats(InspectorInfo& info, float peak, float range, bool approx) {
+    if (peak < 0.0f) return;
+    InspectorStat a{L"Brightest", (approx ? L"≈ " : L"") + BigNumber(peak), peak <= 1.0f};
+    wchar_t buf[48];
+    std::swprintf(buf, std::size(buf), L"%.1f stops", static_cast<double>(range));
+    InspectorStat b{L"Range", buf, false};
+    info.stats = {a, b};
+    if (peak <= 1.0f) info.note = L"Nothing is brighter than 1.0: an ordinary picture saved as HDR.";
+    else if (approx) info.note = L"Measured on a reduced copy of this very large file.";
+}
+
+// The inspector's small preview: the selected tile's thumbnail, tonemapped like the grid.
+const Bitmap* InspectorPreview(const GridItem& it) {
+    if (it.thumb.empty()) return nullptr;
+    if (!g.inspBmp || g.inspBmpPath != it.path || g.inspBmpSettings != g.settings ||
+        g.inspBmp->width() != it.thumb.width || g.inspBmp->height() != it.thumb.height) {
+        try {
+            g.inspBmp = Bitmap::Create(it.thumb.width, it.thumb.height);
+            TonemapThumbnail(it.thumb, g.settings, g.inspBmp->bits());
+            g.inspBmpPath = it.path;
+            g.inspBmpSettings = g.settings;
+        } catch (...) {
+            g.inspBmp.reset();
+            g.inspBmpPath.clear();
+            return nullptr;
+        }
+    }
+    return g.inspBmp.get();
+}
+
+// Brightest value and range of the image on screen, measured once per image.
+void EnsureImageStats() {
+    if (!HasImage() || g.statsFor == g.image.get()) return;
+    ImageQuickStats(*g.image, g.imagePeak, g.imageRange);
+    g.statsFor = g.image.get();
+}
+
+int LayerCount();
+int CurrentLayer();
+
+InspectorInfo MakeInspectorInfo() {
+    InspectorInfo info;
+    wchar_t buf[160];
+    if (g.mode == Mode::Grid) {
+        info.emptyText = g.items.empty()
+            ? (g.searchActive ? L"No file names match your search."
+               : g.library.Size() == 0 ? L"Add the folders where you keep HDRIs and EXRs with “+ Add” on the left. "
+                                          L"You can also open a folder with Ctrl+Shift+O or drop one here."
+                                        : L"No .hdr or .exr files in this folder.")
+            : L"Select an image to see its details.";
+        const int picked = PickedCount();
+        if (picked > 1) {
+            uint64_t total = 0;
+            for (const auto& it : g.items) if (it.picked) total += it.fileSize;
+            info.title = std::to_wstring(picked) + L" images selected";
+            info.lines.push_back(FormatBytes(total) + L" in total");
+            info.buttons.push_back({L"Export " + std::to_wstring(picked) + L" images…", IDM_EXPORT, true, !g.batchBusy});
+            info.buttons.push_back({L"Select all", IDM_SELECT_ALL, false, true});
+            return info;
+        }
+        if (g.selected < 0 || g.selected >= static_cast<int>(g.items.size())) return info;
+        const GridItem& it = g.items[static_cast<size_t>(g.selected)];
+        info.title = it.name;
+        info.preview = InspectorPreview(it);
+        if (it.state == GridItem::State::Done) {
+            std::swprintf(buf, std::size(buf), L"%d × %d · %ls · %ls", it.imageWidth, it.imageHeight,
+                          Utf8ToWide(it.format).c_str(), FormatBytes(it.fileSize).c_str());
+            info.lines.push_back(buf);
+        } else if (it.state == GridItem::State::Failed) {
+            info.lines.push_back(Utf8ToWide(it.error));
+        } else {
+            info.lines.push_back(FormatBytes(it.fileSize) + L" · reading…");
+        }
+        if (const std::wstring d = FormatFileTime(it.writeTime); !d.empty()) info.lines.push_back(L"Modified " + d);
+        info.path = FolderOf(it.path);
+        if (it.state == GridItem::State::Done) AddBrightnessStats(info, it.peakLum, it.rangeStops, it.statsReduced);
+        info.buttons.push_back({L"Open", IDM_IMAGE, true, it.state != GridItem::State::Failed});
+        info.buttons.push_back({L"Show in Explorer", IDM_SHOW_IN_EXPLORER, false, true});
+        return info;
+    }
+    if (!HasImage()) {
+        info.emptyText = g.loadBusy ? L"Opening…" : L"Open an image or a folder to see its details here.";
+        return info;
+    }
+    EnsureImageStats();
+    info.title = FileNameOf(g.path);
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    std::wstring size;
+    if (GetFileAttributesExW(g.path.c_str(), GetFileExInfoStandard, &fa))
+        size = L" · " + FormatBytes((static_cast<uint64_t>(fa.nFileSizeHigh) << 32) | fa.nFileSizeLow);
+    std::swprintf(buf, std::size(buf), L"%d × %d · %ls", g.image->width, g.image->height, Utf8ToWide(g.image->format).c_str());
+    info.lines.push_back(buf + size);
+    if (g.doc && LayerCount() > 1) {
+        const ExrLayer& L = g.doc->Layers()[static_cast<size_t>(std::clamp(CurrentLayer(), 0, LayerCount() - 1))];
+        info.lines.push_back(L"Layer: " + Utf8ToWide(ExrDocument::DisplayName(L)) + L" (" + std::to_wstring(LayerCount()) + L" in this file)");
+    }
+    info.path = FolderOf(g.path);
+    if (!ViewIsData()) AddBrightnessStats(info, g.imagePeak, g.imageRange, false);
+    if (FixActive())
+        info.note = g.showingOriginal ? L"Showing the original. B shows the fixed copy."
+                                      : g.fixSaved ? L"Showing the fixed copy (saved)." : L"Showing the fixed copy, not saved yet: Ctrl+S saves it.";
+    info.buttons.push_back({L"Fix HDRI…", IDM_FIX, true, (CanFix() || FixActive()) && !g.fixBusy});
+    info.buttons.push_back({L"Sun check", IDM_SUN_CHECK, false, !ViewIsData()});
+    if (LooksPanoramic(g.image->width, g.image->height))
+        info.buttons.push_back({PanoActive() ? L"Flat view" : L"360° view", IDM_PANO, false, true});
+    info.buttons.push_back({L"Show in Explorer", IDM_SHOW_IN_EXPLORER, false, true});
+    return info;
+}
+
+// The strip above the grid: what is showing, and "Include subfolders" for library folders.
+RECT g_subToggle{};
+
+void DrawGridHeader(HDC dc, const RECT& r) {
+    PanelFill(dc, r, kBackground);
+    RECT line{r.left, r.bottom - 1, r.right, r.bottom};
+    PanelFill(dc, line, panel::kLine);
+    const int pad = Scale(18);
+    g_subToggle = RECT{};
+    std::wstring title, right;
+    wchar_t buf[200];
+    const int n = static_cast<int>(g.items.size());
+    if (g.searchActive) {
+        if (g.searchHits < 5000) std::swprintf(buf, std::size(buf), g.searchHits == 1 ? L"%zu result for “%ls”"
+                                                                                       : L"%zu results for “%ls”",
+                                               g.searchHits, g.searchQuery.c_str());
+        else std::swprintf(buf, std::size(buf), L"5,000+ results for “%ls”", g.searchQuery.c_str());
+        title = buf;
+        right = (!g.searchAll && !g.searchFolder.empty()) ? L"in " + LeafName(g.searchFolder) : L"in all folders";
+        right += L"   ·   Esc clears";
+    } else {
+        title = g.gridFolder;
+        std::swprintf(buf, std::size(buf), n == 1 ? L"%d image" : L"%d images", n);
+        right = buf;
+    }
+    RECT rr{r.left + pad, r.top, r.right - pad, r.bottom};
+    // "Include subfolders" for folders in the library.
+    const int root = g.searchActive ? -1 : g.library.RootOf(g.gridFolder);
+    int rightEdge = rr.right;
+    if (root >= 0) {
+        const bool on = g.library.Folders()[static_cast<size_t>(root)].subfolders;
+        const int boxS = Scale(14), w = Scale(140);
+        g_subToggle = RECT{rr.right - w, r.top + Scale(6), rr.right, r.bottom - Scale(6)};
+        const int bx = g_subToggle.left, by = (r.top + r.bottom) / 2 - boxS / 2;
+        RECT box{bx, by, bx + boxS, by + boxS};
+        PanelRound(dc, box, on ? panel::kAccent : panel::kButtonHot, Scale(3));
+        if (on) {
+            HPEN pen = CreatePen(PS_SOLID, std::max(2, Scale(2)), RGB(0xff, 0xff, 0xff));
+            HGDIOBJ op = SelectObject(dc, pen);
+            POINT pts[3] = {{bx + boxS * 22 / 100, by + boxS * 52 / 100}, {bx + boxS * 42 / 100, by + boxS * 72 / 100},
+                            {bx + boxS * 78 / 100, by + boxS * 30 / 100}};
+            Polyline(dc, pts, 3);
+            SelectObject(dc, op);
+            DeleteObject(pen);
+        }
+        PanelText(dc, g.font, panel::kSoft, L"Include subfolders", RECT{bx + boxS + Scale(8), r.top, g_subToggle.right, r.bottom},
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        rightEdge = g_subToggle.left - Scale(20);
+    }
+    const int rw = Scale(static_cast<int>(right.size()) * 7 + 10);
+    RECT countR{std::max<LONG>(rr.left, rightEdge - rw), r.top, rightEdge, r.bottom};
+    PanelText(dc, g.font, panel::kDim, right, countR, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    RECT titleR{rr.left, r.top, std::max<LONG>(rr.left, countR.left - Scale(12)), r.bottom};
+    PanelText(dc, g.titleFont, panel::kText, title, titleR,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | (g.searchActive ? DT_END_ELLIPSIS : DT_PATH_ELLIPSIS));
+}
+
 bool SelectedOpenable() {
     return g.selected >= 0 && g.selected < static_cast<int>(g.items.size()) &&
            g.items[static_cast<size_t>(g.selected)].state != GridItem::State::Failed;
@@ -2336,7 +3136,14 @@ void OnPaint(HWND hwnd) {
     if (g.mode == Mode::Grid) {
         LayoutGrid();
         if (g.items.empty()) {
-            DrawCenteredText(dc, vp, L"No .hdr or .exr files in this folder", g.gridFolder);
+            if (g.searchActive)
+                DrawCenteredText(dc, vp, L"No file names match \u201c" + g.searchQuery + L"\u201d",
+                                 g.searchAll ? L"Searched all library folders" : L"Searched " + g.searchFolder);
+            else if (g.gridFolder.empty())
+                DrawCenteredText(dc, vp, L"Add a folder with \u201c+ Add\u201d on the left, or drop one here",
+                                 L"Ctrl+Shift+O opens a folder, Ctrl+O a file");
+            else
+                DrawCenteredText(dc, vp, L"No .hdr or .exr files in this folder", g.gridFolder);
         } else {
             int first, last;
             g.grid.VisibleRange(first, last);
@@ -2344,6 +3151,7 @@ void OnPaint(HWND hwnd) {
             g.grid.Draw(dc, vp, g.items, g.settings, g.selected, g.gridHover,
                         g.scrollHot || g.drag == Drag::Scroll, GridFonts{g.font, g.font});
         }
+        DrawGridHeader(dc, GridHeaderRect());   // after the tiles: a half-scrolled row stays under it
     } else if (GridItem* ph = PlaceholderItem()) {
         DrawPlaceholder(dc, vp, *ph);
     } else if (HasImage()) {
@@ -2353,6 +3161,11 @@ void OnPaint(HWND hwnd) {
     } else {
         DrawCenteredText(dc, vp, L"Drop an .hdr or .exr file, or a folder, here",
                          L"Ctrl+O opens a file, Ctrl+Shift+O a folder of images");
+    }
+    if (SidebarShown()) g.sidebar.Draw(dc, MakeSidebarState(), MakePanelFonts());
+    if (InspectorShown() && !g.fixPanelOn) {
+        g.inspector.Layout(InspectorRect(), g.dpi);
+        g.inspector.Draw(dc, MakeInspectorInfo(), MakePanelFonts(), g.inspHover, g.inspPressed);
     }
     DrawInfoBar(dc, bar);
     g.toolbar.Draw(dc, MakeToolbarState(), g.font);
@@ -2386,6 +3199,14 @@ void ShowShortcuts() {
             InfoKeys(L"Home|End", L"First / last file"),
             InfoKeys(L"Ctrl|E", L"Export as PNG or JPEG"),
 
+            InfoHeader(L"Folders panel and search"),
+            InfoKeys(L"Ctrl|F", L"Search file names in your folders"),
+            InfoKeys(L"Esc", L"In the search box: clear the search"),
+            InfoKeys(L"Ctrl|B", L"Show / hide the folders panel"),
+            InfoKeys(L"Ctrl|I", L"Show / hide the inspector"),
+            InfoKeys(L"Right-click", L"On a folder: rescan, subfolders, remove"),
+            InfoKeys(L"Ctrl|Z", L"Bring back a removed folder"),
+
             InfoHeader(L"Switching views"),
             InfoKeys(L"G", L"Show the folder grid"),
             InfoKeys(L"Esc", L"From an image back to the grid"),
@@ -2418,7 +3239,7 @@ void ShowShortcuts() {
             InfoKeys(L"Double-click", L"On the slider: reset"),
 
             InfoHeader(L"Fix HDRI"),
-            InfoKeys(L"H", L"Check the HDRI and choose fixes"),
+            InfoKeys(L"H", L"Fix HDRI panel: check the HDRI, choose fixes (H again closes it)"),
             InfoKeys(L"B", L"Before / after the fix"),
             InfoKeys(L"Ctrl|S", L"Save the fixed copy (EXR or HDR)"),
             InfoKeys(L"S", L"Sun check: look at the sun, exposed for a real sun"),
@@ -2534,7 +3355,10 @@ void ShowAbout() {
                      L"you need as PNG or JPEG."),
 
             InfoHeader(L"Main features"),
+            InfoBullet(L"Your HDRI and EXR folders in one place: add folders from any drive, browse them "
+                       L"as a tree, and search file names across all of them."),
             InfoBullet(L"Thumbnail grid of a folder, made in the background, adjustable size."),
+            InfoBullet(L"Inspector: size, brightest value and range of the selected image."),
             InfoBullet(L"Image view with zoom, pan, Fit and 100%, and arrow-key browsing."),
             InfoBullet(L"360\u00b0 view: look around inside an equirectangular HDRI."),
             InfoBullet(L"Exposure from \u221210 to +10 EV and Clip, Reinhard or ACES tonemapping."),
@@ -2550,17 +3374,15 @@ void ShowAbout() {
         },
         {
             InfoHeader(L"Coming next"),
-            InfoSubheader(L"v0.10 \u2014 HDRI prep"),
+            InfoSubheader(L"v0.11 \u2014 Smart library"),
+            InfoBullet(L"Badges on the thumbnails (clipped sun, real sun, low sun) and filters for them."),
+            InfoBullet(L"Favourites, tags, recently opened; sort by brightness or sun height."),
+            InfoSubheader(L"v0.12 \u2014 HDRI prep"),
             InfoBullet(L"Sun to light: its direction, strength and colour, ready to copy into Unreal or Blender."),
             InfoBullet(L"Calibrate: see how much light the HDRI gives (lux), scale it to a value you measured or a preset "
                        L"(sunny day, overcast, sunset), white balance from a grey spot, and convert colour spaces (sRGB / ACEScg)."),
-            InfoBullet(L"Remove the sun; rotate and level the horizon."),
-            InfoBullet(L"Batch resize (2K / 4K / 8K) and convert between EXR and HDR."),
-            InfoSubheader(L"v0.11 \u2014 HDRI library"),
-            InfoBullet(L"Favourites, tags and search across your HDRI folders."),
-            InfoBullet(L"Sort by brightness, sun height or colour temperature."),
-            InfoBullet(L"Drag an HDRI from the grid straight into Unreal or Blender."),
-            InfoSubheader(L"v0.12 \u2014 Inspect"),
+            InfoBullet(L"Remove the sun; rotate and level the horizon; batch resize and convert."),
+            InfoSubheader(L"v0.13 \u2014 Inspect"),
             InfoBullet(L"Histogram and false colour; chrome and grey ball lighting preview."),
             InfoBullet(L"Metadata panel: camera, lens and render settings stored in the file."),
             InfoSubheader(L"v1.0 \u2014 Launch"),
@@ -2577,6 +3399,9 @@ void ShowAbout() {
                      L"and changes nothing in the app."),
             InfoAction(L"Source code on GitHub\u2026", [](HWND owner) {
                 ShellExecuteW(owner, L"open", kSourcePage, nullptr, nullptr, SW_SHOWNORMAL);
+            }),
+            InfoAction(L"Sponsor on GitHub\u2026", [](HWND owner) {
+                ShellExecuteW(owner, L"open", kSponsorPage, nullptr, nullptr, SW_SHOWNORMAL);
             }),
             InfoAction(L"Download page and support\u2026", [](HWND owner) {
                 ShellExecuteW(owner, L"open", kDownloadPage, nullptr, nullptr, SW_SHOWNORMAL);
@@ -2608,9 +3433,11 @@ void GridMove(int delta) {
 // multi-selection to one tile, then go from an image to the grid.
 void OnEscape() {
     if (g.batchBusy) { CancelBatch(); return; }
+    if (g.fixPanelOn) { CloseFixPanel(); return; }
     if (g.mode == Mode::Single && !g.isolate.empty()) { SetIsolation({}); return; }
     if (g.mode == Mode::Grid) {
         if (PickedCount() > 1) { PickOnly(g.selected); Redraw(); }
+        else if (g.searchActive) EndSearch(true);
         return;
     }
     Command(IDM_GRID);
@@ -2627,6 +3454,7 @@ void ShowContextMenu(POINT client) {
         AppendMenuW(m, MF_STRING | (n == 1 && SelectedOpenable() ? 0 : MF_GRAYED), IDM_IMAGE, L"&Open\tEnter");
         std::wstring exp = n == 1 ? L"&Export\u2026\tCtrl+E" : L"&Export " + std::to_wstring(n) + L" images\u2026\tCtrl+E";
         AppendMenuW(m, MF_STRING | (g.batchBusy ? MF_GRAYED : 0), IDM_EXPORT, exp.c_str());
+        AppendMenuW(m, MF_STRING | (n == 1 ? 0 : MF_GRAYED), IDM_SHOW_IN_EXPLORER, L"Show in E&xplorer");
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(m, MF_STRING, IDM_SELECT_ALL, L"Select &all\tCtrl+A");
     } else {
@@ -2677,8 +3505,27 @@ void Command(UINT id) {
         case IDM_ABOUT: ShowAbout(); break;
         case IDM_SOURCE: ShellExecuteW(g.hwnd, L"open", kSourcePage, nullptr, nullptr, SW_SHOWNORMAL); break;
         case IDM_SUPPORT: ShellExecuteW(g.hwnd, L"open", kDownloadPage, nullptr, nullptr, SW_SHOWNORMAL); break;
+        case IDM_SPONSOR: ShellExecuteW(g.hwnd, L"open", kSponsorPage, nullptr, nullptr, SW_SHOWNORMAL); break;
+        case IDM_ADD_FOLDER: ShowAddFolderDialog(); break;
+        case IDM_FIND: FocusSearch(); break;
+        case IDM_UNDO_REMOVE: UndoRemoveFolder(); break;
+        case IDM_TOGGLE_SIDEBAR:
+            g.cfg.showSidebar = !g.cfg.showSidebar;
+            if (!g.cfg.showSidebar && GetFocus() == g.searchEdit) SetFocus(g.hwnd);
+            SaveLibrary();
+            OnResize();
+            break;
+        case IDM_TOGGLE_INSPECTOR:
+            g.cfg.showInspector = !g.cfg.showInspector;
+            SaveLibrary();
+            OnResize();
+            break;
+        case IDM_SHOW_IN_EXPLORER:
+            if (grid) { if (g.selected >= 0 && g.selected < static_cast<int>(g.items.size())) ShowInExplorer(g.items[static_cast<size_t>(g.selected)].path, true); }
+            else if (!g.path.empty()) ShowInExplorer(g.path, true);
+            break;
         case IDM_SUN_CHECK: if (!grid) ToggleSunCheck(); break;
-        case IDM_FIX: if (!grid) StartFix(); break;
+        case IDM_FIX: if (g.fixPanelOn) CloseFixPanel(); else if (!grid) StartFix(); break;
         case IDM_FIX_COMPARE: if (!grid) ToggleFixCompare(); break;
         case IDM_SAVE_FIXED: if (!grid) ShowSaveFixedDialog(); break;
         case IDM_PANO:
@@ -2754,6 +3601,31 @@ void SetHover(ToolId t) {
 
 bool ExposureEnabled() { return MakeToolbarState().hasImage; }
 
+void OnSidebarClick(POINT p) {
+    const SidebarHit h = g.sidebar.HitTest(p, MakeSidebarState());
+    const TreeRow* row = h.row >= 0 && h.row < static_cast<int>(g.rows.size()) ? &g.rows[static_cast<size_t>(h.row)] : nullptr;
+    switch (h.part) {
+        case SidebarPart::Add:
+        case SidebarPart::EmptyAdd: ShowAddFolderDialog(); break;
+        case SidebarPart::ScopeThis:
+        case SidebarPart::ScopeAll:
+            g.searchAll = h.part == SidebarPart::ScopeAll;
+            if (g.searchActive) RunSearch();
+            RefreshTree();
+            break;
+        case SidebarPart::RowChevron: if (row) ToggleExpanded(row->path); break;
+        case SidebarPart::RowRemove: if (row) RemoveLibraryFolder(row->root); break;
+        case SidebarPart::Row:
+            if (!row) break;
+            if (row->missing) { SetStatus(L"This folder isn\u2019t there (an unplugged drive?). EXRay keeps looking for it."); break; }
+            if (!ConfirmDiscardFix()) break;
+            if (g.searchActive && GetWindowTextLengthW(g.searchEdit) > 0) SetWindowTextW(g.searchEdit, L"");
+            OpenFolder(row->path, L"");
+            break;
+        default: break;
+    }
+}
+
 void OnLButtonDown(POINT p) {
     SetFocus(g.hwnd);
     ToolId t = g.toolbar.HitTest(p);
@@ -2771,6 +3643,23 @@ void OnLButtonDown(POINT p) {
         g.pressed = t;
         SetCapture(g.hwnd);
         InvalidateToolbar();
+        return;
+    }
+    if (SidebarShown() && PtInRect(&g.sidebar.Area(), p)) { OnSidebarClick(p); return; }
+    if (InspectorShown() && !g.fixPanelOn && PtInRect(&g.inspector.Area(), p)) {
+        const int id = g.inspector.HitTest(p);
+        if (id) {
+            g.inspPressed = id;
+            g.drag = Drag::Panel;
+            SetCapture(g.hwnd);
+            RECT r = InspectorRect();
+            InvalidateRect(g.hwnd, &r, FALSE);
+        }
+        return;
+    }
+    if (g.mode == Mode::Grid && PtInRect(&g_subToggle, p)) {
+        const int root = g.library.RootOf(g.gridFolder);
+        if (root >= 0) SetLibrarySubfolders(root, !g.library.Folders()[static_cast<size_t>(root)].subfolders);
         return;
     }
     if (PtInRect(&g.layerChip, p)) { ShowLayerMenu(); return; }
@@ -2884,6 +3773,22 @@ void CopyPixel() {
     SetStatus(CurrentCrypto() >= 0 ? L"Object names copied" : L"Pixel values copied");
 }
 
+// Hover highlight in the sidebar and on the inspector's buttons.
+void UpdatePanelHover(POINT p) {
+    const SidebarHit sh = SidebarShown() ? g.sidebar.HitTest(p, MakeSidebarState()) : SidebarHit{};
+    if (sh != g.sideHover) {
+        g.sideHover = sh;
+        RECT r = SidebarRect();
+        InvalidateRect(g.hwnd, &r, FALSE);
+    }
+    const int ih = InspectorShown() && !g.fixPanelOn ? g.inspector.HitTest(p) : 0;
+    if (ih != g.inspHover) {
+        g.inspHover = ih;
+        RECT r = InspectorRect();
+        InvalidateRect(g.hwnd, &r, FALSE);
+    }
+}
+
 void OnMouseMove(POINT p) {
     if (!g.trackingLeave) {
         TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, g.hwnd, 0};
@@ -2925,9 +3830,11 @@ void OnMouseMove(POINT p) {
             Redraw();
             return;
         case Drag::Button:
+        case Drag::Panel:
             return;   // keep the pressed look; the action happens on release
         case Drag::None:
             SetHover(g.toolbar.HitTest(p));
+            UpdatePanelHover(p);
             UpdatePixelReadout(p);
             if (const bool hot = PtInRect(&g.layerChip, p) != FALSE; hot != g.chipHot) {
                 g.chipHot = hot;
@@ -2954,6 +3861,7 @@ void OnMouseMove(POINT p) {
 
 void EndDrag() {
     if (g.drag == Drag::Slider) RequestFullRender();
+    if (g.drag == Drag::Panel) { g.inspPressed = 0; RECT r = InspectorRect(); InvalidateRect(g.hwnd, &r, FALSE); }
     if (g.drag == Drag::Scroll || g.drag == Drag::SizeSlider) Redraw();
     g.drag = Drag::None;
     if (g.pressed != ToolId::None) { g.pressed = ToolId::None; InvalidateToolbar(); }
@@ -2962,7 +3870,13 @@ void EndDrag() {
 void OnLButtonUp(POINT p) {
     const Drag d = g.drag;
     const ToolId pressed = g.pressed;
+    const int panelPressed = g.inspPressed;
     EndDrag();
+    if (d == Drag::Panel) {
+        if (GetCapture() == g.hwnd) ReleaseCapture();
+        if (panelPressed && g.inspector.HitTest(p) == panelPressed) Command(static_cast<UINT>(panelPressed));
+        return;
+    }
     if (GetCapture() == g.hwnd) ReleaseCapture();
     if (d == Drag::Button && g.toolbar.HitTest(p) == pressed) ToolAction(pressed);
     if (d == Drag::Pan && !g.movedSinceDown && CurrentCrypto() >= 0) CryptoClick(p, CtrlDown());
@@ -2970,6 +3884,14 @@ void OnLButtonUp(POINT p) {
 }
 
 void OnDoubleClick(POINT p) {
+    if (SidebarShown() && PtInRect(&g.sidebar.Area(), p)) {   // a second quick click: open / fold again
+        const SidebarHit h = g.sidebar.HitTest(p, MakeSidebarState());
+        if (h.part == SidebarPart::Row && h.row >= 0 && g.rows[static_cast<size_t>(h.row)].hasChildren)
+            ToggleExpanded(g.rows[static_cast<size_t>(h.row)].path);
+        else if (h.part != SidebarPart::Row) OnSidebarClick(p);
+        return;
+    }
+    if (InspectorShown() && !g.fixPanelOn && PtInRect(&g.inspector.Area(), p)) { OnLButtonDown(p); return; }
     ToolId t = g.toolbar.HitTest(p);
     if (t == ToolId::Slider) {
         if (ExposureEnabled()) { SetExposure(0.0f); RequestFullRender(); }
@@ -2997,6 +3919,19 @@ void OnMouseWheel(POINT screenPt, int delta) {
     POINT p = screenPt;
     ScreenToClient(g.hwnd, &p);
     const double notches = delta / static_cast<double>(WHEEL_DELTA);
+    if (SidebarShown() && PtInRect(&g.sidebar.Area(), p)) {
+        if (g.sidebar.ScrollBy(-static_cast<int>(std::lround(notches * 3 * g.sidebar.RowHeight())))) {
+            UpdatePanelHover(p);
+            RECT r = SidebarRect();
+            InvalidateRect(g.hwnd, &r, FALSE);
+        }
+        return;
+    }
+    if (g.fixPanelOn && g.fixPanel && PtInRect(&g.inspector.Area(), p)) {
+        SendMessageW(g.fixPanel, WM_MOUSEWHEEL, MAKEWPARAM(0, static_cast<WORD>(static_cast<short>(delta))),
+                     MAKELPARAM(screenPt.x, screenPt.y));
+        return;
+    }
     if (g.toolbar.HitTest(p) == ToolId::Slider) {
         if (!ExposureEnabled()) return;
         SetExposure(g.settings.exposureEV + static_cast<float>(0.1 * notches));
@@ -3028,6 +3963,12 @@ bool OnSetCursor() {
     GetCursorPos(&p);
     ScreenToClient(g.hwnd, &p);
     if (PtInRect(&g.layerChip, p)) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return true; }
+    if ((g.sideHover.part != SidebarPart::None && SidebarShown() && PtInRect(&g.sidebar.Area(), p)) ||
+        (g.inspHover && InspectorShown() && !g.fixPanelOn && PtInRect(&g.inspector.Area(), p)) ||
+        (g.mode == Mode::Grid && PtInRect(&g_subToggle, p))) {
+        SetCursor(LoadCursorW(nullptr, IDC_HAND));
+        return true;
+    }
     if (g.mode == Mode::Grid) return false;
     if (g.drag == Drag::Pan && CanPan()) { SetCursor(LoadCursorW(nullptr, IDC_SIZEALL)); return true; }
     if (InViewport(p) && PanoActive()) { SetCursor(LoadCursorW(nullptr, IDC_SIZEALL)); return true; }
@@ -3068,6 +4009,7 @@ bool OnKeyDown(WPARAM vk) {
         case VK_ESCAPE: OnEscape(); return true;
         case VK_BACK: Command(IDM_GRID); return true;
         case 'A': if (ctrl) { Command(IDM_SELECT_ALL); return true; } break;
+        case 'Z': if (ctrl) { Command(IDM_UNDO_REMOVE); return true; } break;
         case '0': case VK_NUMPAD0: if (ctrl) { Command(IDM_THUMB_RESET); return true; } break;
         case VK_F5: Command(IDM_REFRESH); return true;
         case VK_F1: Command(IDM_SHORTCUTS); return true;
@@ -3077,16 +4019,16 @@ bool OnKeyDown(WPARAM vk) {
         case 'E': if (ctrl) { Command(IDM_EXPORT); return true; } break;
         case 'C': if (ctrl) { Command(IDM_COPY_PIXEL); return true; } break;
         case 'L': if (!ctrl) { Command(IDM_LAYER_MENU); return true; } break;
-        case 'I': if (!ctrl) { Command(IDM_INVERT_DEPTH); return true; } break;
+        case 'I': Command(ctrl ? IDM_TOGGLE_INSPECTOR : IDM_INVERT_DEPTH); return true;
         case 'V': if (!ctrl) { Command(IDM_PANO); return true; } break;
         case 'H': if (!ctrl) { Command(IDM_FIX); return true; } break;
-        case 'B': if (!ctrl) { Command(IDM_FIX_COMPARE); return true; } break;
+        case 'B': Command(ctrl ? IDM_TOGGLE_SIDEBAR : IDM_FIX_COMPARE); return true;
         case 'S': Command(ctrl ? IDM_SAVE_FIXED : IDM_SUN_CHECK); return true;
         case VK_OEM_4: Command(IDM_LAYER_PREV); return true;   // [
         case VK_OEM_6: Command(IDM_LAYER_NEXT); return true;   // ]
         case 'R': if (!ctrl) { Command(IDM_EXP_RESET); return true; } break;
         case 'T': if (!ctrl) { Command(IDM_TM_CYCLE); return true; } break;
-        case 'F': if (!ctrl) { Command(IDM_FIT); return true; } break;
+        case 'F': Command(ctrl ? IDM_FIND : IDM_FIT); return true;
         case '1': case VK_NUMPAD1: if (!ctrl) { Command(IDM_ACTUAL); return true; } break;
     }
     return false;
@@ -3098,6 +4040,7 @@ HMENU BuildMenu() {
     HMENU file = CreatePopupMenu();
     AppendMenuW(file, MF_STRING, IDM_OPEN, L"&Open file\u2026\tCtrl+O");
     AppendMenuW(file, MF_STRING, IDM_OPEN_FOLDER, L"Open &folder\u2026\tCtrl+Shift+O");
+    AppendMenuW(file, MF_STRING, IDM_ADD_FOLDER, L"&Add folder to the library\u2026");
     AppendMenuW(file, MF_STRING, IDM_REFRESH, L"&Refresh folder\tF5");
     AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(file, MF_STRING, IDM_EXPORT, L"&Export as PNG or JPEG\u2026\tCtrl+E");
@@ -3112,6 +4055,10 @@ HMENU BuildMenu() {
     AppendMenuW(file, MF_STRING, IDM_EXIT, L"E&xit");
 
     HMENU view = CreatePopupMenu();
+    AppendMenuW(view, MF_STRING, IDM_TOGGLE_SIDEBAR, L"F&olders panel\tCtrl+B");
+    AppendMenuW(view, MF_STRING, IDM_TOGGLE_INSPECTOR, L"I&nspector\tCtrl+I");
+    AppendMenuW(view, MF_STRING, IDM_FIND, L"Searc&h files\tCtrl+F");
+    AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(view, MF_STRING, IDM_GRID, L"Folder &grid\tG");
     AppendMenuW(view, MF_STRING, IDM_IMAGE, L"Open selected &image\tEnter");
     AppendMenuW(view, MF_STRING, IDM_THUMB_BIGGER, L"&Bigger thumbnails\tCtrl++");
@@ -3153,7 +4100,8 @@ HMENU BuildMenu() {
     AppendMenuW(help, MF_STRING, IDM_SHORTCUTS, L"&Controls and shortcuts\tF1");
     AppendMenuW(help, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(help, MF_STRING, IDM_SOURCE, L"Source code on &GitHub");
-    AppendMenuW(help, MF_STRING, IDM_SUPPORT, L"&Support EXRay\u2026");
+    AppendMenuW(help, MF_STRING, IDM_SPONSOR, L"S&ponsor on GitHub\u2026");
+    AppendMenuW(help, MF_STRING, IDM_SUPPORT, L"&Support on Gumroad\u2026");
     AppendMenuW(help, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(help, MF_STRING, IDM_ABOUT, L"&About");
 
@@ -3208,11 +4156,42 @@ void UpdateMenuChecks(HMENU menu) {
                        : g.settings.curve == Tonemap::Reinhard ? IDM_TM_REINHARD : IDM_TM_ACES,
                        MF_BYCOMMAND);
     CheckMenuItem(menu, IDM_FIT, MF_BYCOMMAND | (g.fit && st.viewControls ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, IDM_TOGGLE_SIDEBAR, MF_BYCOMMAND | (g.cfg.showSidebar ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, IDM_TOGGLE_INSPECTOR, MF_BYCOMMAND | (g.cfg.showInspector ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(menu, IDM_FIX, MF_BYCOMMAND | (g.fixPanelOn ? MF_CHECKED : MF_UNCHECKED));
+    enable(IDM_FIX, (st.viewControls && CanFix() && !g.fixBusy) || g.fixPanelOn);
+}
+
+// The search box and the Fix HDRI panel are child windows placed over the panels.
+void PlaceChildren() {
+    if (g.searchEdit) {
+        if (SidebarShown()) {
+            const RECT b = g.sidebar.SearchBoxRect();
+            const int h = Scale(20);
+            SetWindowPos(g.searchEdit, nullptr, b.left + Scale(30), (b.top + b.bottom - h) / 2, (b.right - b.left) - Scale(38), h,
+                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        } else {
+            if (GetFocus() == g.searchEdit) SetFocus(g.hwnd);
+            ShowWindow(g.searchEdit, SW_HIDE);
+        }
+    }
+    if (g.fixPanel) {
+        if (g.fixPanelOn) {
+            const RECT r = InspectorRect();
+            g.inspector.Layout(r, g.dpi);
+            SetWindowPos(g.fixPanel, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        } else {
+            ShowWindow(g.fixPanel, SW_HIDE);
+        }
+    }
 }
 
 void OnResize() {
     RECT r = ClientRect();
     g.toolbar.Layout(r.right, g.dpi);
+    g.sidebar.Layout(SidebarRect(), g.dpi, static_cast<int>(g.rows.size()));
+    g.inspector.Layout(InspectorRect(), g.dpi);
+    PlaceChildren();
     if (g.fit) SetFit();
     else ClampView();
     LayoutGrid();
@@ -3234,6 +4213,8 @@ void SaveWindowSettings() {
     g.cfg.thumbScale = g.thumbScale;
     g.cfg.exposureEV = g.sunCheck.on ? g.sunCheck.look.exposureEV : g.settings.exposureEV;
     g.cfg.curve = g.settings.curve;
+    g.cfg.libraryFolders = g.library.Save();
+    g.cfg.expandedFolders.assign(g.expanded.begin(), g.expanded.end());
     SaveSettings(g.cfg);
 }
 
@@ -3328,6 +4309,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g.grid.SetDpi(g.dpi, g.thumbScale);
             RecreateFonts();
             DragAcceptFiles(hwnd, TRUE);
+            g.editBrush = CreateSolidBrush(panel::kButton);
+            g.searchEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL, 0, 0, 10, 10, hwnd,
+                                           reinterpret_cast<HMENU>(static_cast<INT_PTR>(4000)), GetModuleHandleW(nullptr), nullptr);
+            if (g.searchEdit) {
+                SendMessageW(g.searchEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), FALSE);
+                SendMessageW(g.searchEdit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Search files   Ctrl+F"));
+                g.searchEditProc = reinterpret_cast<WNDPROC>(
+                    SetWindowLongPtrW(g.searchEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(SearchEditProc)));
+            }
+            g.fixPanel = CreateFixPanel(hwnd);
+            RefreshTree();
             OnResize();
             return 0;
 
@@ -3335,6 +4327,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g.dpi = HIWORD(wp);
             g.grid.SetDpi(g.dpi, g.thumbScale);
             RecreateFonts();
+            if (g.searchEdit) SendMessageW(g.searchEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g.font), TRUE);
+            if (g.fixPanel) FixPanelDpiChanged(g.fixPanel);
             const RECT* r = reinterpret_cast<const RECT*>(lp);
             SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                          SWP_NOZORDER | SWP_NOACTIVATE);
@@ -3391,6 +4385,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSELEAVE:
             g.trackingLeave = false;
             SetHover(ToolId::None);
+            if (g.sideHover.part != SidebarPart::None || g.inspHover) {
+                g.sideHover = SidebarHit{};
+                g.inspHover = 0;
+                Redraw();
+            }
             if (g.gridHover >= 0 || g.scrollHot || g.pixelValid || g.chipHot) {
                 g.gridHover = -1; g.scrollHot = false; g.pixelValid = false; g.chipHot = false;
                 Redraw();
@@ -3423,6 +4422,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 RemakeThumbsIfNeeded();
                 return 0;
             }
+            if (wp == kSearchTimer) { RunSearch(); return 0; }
+            if (wp == kLibraryTimer) { OnLibraryChanged(); return 0; }
+            if (wp == kLibCheckTimer) { CheckMissingFolders(); return 0; }
             if (wp == kStatusTimer) {
                 KillTimer(hwnd, kStatusTimer);
                 g.status.clear();
@@ -3459,7 +4461,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
 
         case WM_COMMAND:
+            if (lp && reinterpret_cast<HWND>(lp) == g.searchEdit) {
+                if (HIWORD(wp) == EN_CHANGE) SetTimer(hwnd, kSearchTimer, 250, nullptr);
+                return 0;
+            }
             Command(LOWORD(wp));
+            return 0;
+
+        case WM_CTLCOLOREDIT:
+            if (reinterpret_cast<HWND>(lp) == g.searchEdit && g.editBrush) {
+                HDC dc = reinterpret_cast<HDC>(wp);
+                SetTextColor(dc, panel::kText);
+                SetBkColor(dc, panel::kButton);
+                return reinterpret_cast<LRESULT>(g.editBrush);
+            }
+            break;
+
+        case WM_APP_FIXPANEL:
+            OnFixPanel(static_cast<FixWindowResult>(wp));
+            return 0;
+        case WM_APP_SCANNED:
+            OnScanned(reinterpret_cast<ScanDone*>(lp));
+            return 0;
+        case WM_APP_LIBCHANGED:
+            SetTimer(hwnd, kLibraryTimer, 1000, nullptr);
             return 0;
 
         case WM_APP_LOADED:
@@ -3503,6 +4528,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else {
                 ScreenToClient(hwnd, &p);
             }
+            if (SidebarShown() && PtInRect(&g.sidebar.Area(), p)) {
+                const SidebarHit h = g.sidebar.HitTest(p, MakeSidebarState());
+                if (h.row >= 0) ShowFolderMenu(h.row, p);
+                return 0;
+            }
             if (InViewport(p)) { ShowContextMenu(p); return 0; }
             break;
         }
@@ -3515,6 +4545,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd, kRenderTimer);
             if (g.font) DeleteObject(g.font);
             if (g.bigFont) DeleteObject(g.bigFont);
+            for (HFONT f : {g.boldFont, g.smallFont, g.titleFont}) if (f) DeleteObject(f);
+            if (g.editBrush) DeleteObject(g.editBrush);
             PostQuitMessage(0);
             return 0;
     }
@@ -3531,6 +4563,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     g.thumbScale = g.cfg.thumbScale;
     g.settings.exposureEV = g.cfg.exposureEV;
     g.settings.curve = g.cfg.curve;
+    g.library.Load(g.cfg.libraryFolders);
+    for (const auto& e : g.cfg.expandedFolders) g.expanded.insert(PathKey(e));
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
@@ -3548,7 +4582,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     int w = MulDiv(1280, static_cast<int>(sysDpi), 96);
     int h = MulDiv(800, static_cast<int>(sysDpi), 96);
 
-    HWND hwnd = CreateWindowExW(0, kClassName, AppTitle().c_str(), WS_OVERLAPPEDWINDOW,
+    HWND hwnd = CreateWindowExW(0, kClassName, AppTitle().c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                 CW_USEDEFAULT, CW_USEDEFAULT, w, h,
                                 nullptr, BuildMenu(), inst, nullptr);
     if (!hwnd) return 1;
@@ -3583,13 +4617,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     if (!placed) ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
 
-    // A file or folder passed on the command line (or dropped onto the .exe).
+    // The folder library: read the folders in the background and watch them.
+    ScanAll();
+    RestartWatcher();
+    SetTimer(hwnd, kLibCheckTimer, 10000, nullptr);
+
+    // A file or folder passed on the command line (or dropped onto the .exe);
+    // otherwise the folder that was open last time.
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    bool opened = false;
     if (argv) {
-        if (argc > 1) OpenPath(argv[1]);
+        if (argc > 1) { OpenPath(argv[1]); opened = true; }
         LocalFree(argv);
     }
+    if (!opened && !g.cfg.lastFolder.empty() && IsFolder(g.cfg.lastFolder)) OpenFolder(g.cfg.lastFolder, L"");
 
     ACCEL accel[] = { {FVIRTKEY | FCONTROL, 'O', IDM_OPEN},
                       {FVIRTKEY | FCONTROL | FSHIFT, 'O', IDM_OPEN_FOLDER},
@@ -3600,7 +4642,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
-        if (!TranslateAcceleratorW(hwnd, hAccel, &m)) {
+        // While typing in the search box, its keys (Ctrl+A, Ctrl+C...) are its own.
+        if (GetFocus() == g.searchEdit || !TranslateAcceleratorW(hwnd, hAccel, &m)) {
             TranslateMessage(&m);
             DispatchMessageW(&m);
         }

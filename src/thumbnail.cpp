@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 #include <new>
 #include "resample.h"
 
@@ -152,4 +153,29 @@ void TonemapThumbnail(const Thumbnail& thumb, const TonemapSettings& s, uint8_t*
     tmp.width = thumb.width;
     tmp.height = thumb.height;
     TonemapToBGRA8(tmp, s, outBGRA);
+}
+
+void ImageQuickStats(const HdrImage& img, float& peakLum, float& rangeStops) {
+    peakLum = 0.0f;
+    rangeStops = 0.0f;
+    if (img.empty()) return;
+    const size_t n = static_cast<size_t>(img.width) * img.height;
+    const float* px = img.rgb();
+    const size_t step = std::max<size_t>(1, n / 262144);   // about 262,000 samples for the median
+    std::vector<float> sample;
+    sample.reserve(n / step + 1);
+    float peak = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        const float* p = px + i * 3;
+        const float l = 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2];
+        if (!(l >= 0.0f) || l > 3.0e38f) continue;   // NaN, negative, infinite
+        if (l > peak) peak = l;
+        if (i % step == 0) sample.push_back(l);
+    }
+    peakLum = peak;
+    if (sample.empty() || peak <= 0.0f) return;
+    std::nth_element(sample.begin(), sample.begin() + static_cast<std::ptrdiff_t>(sample.size() / 2), sample.end());
+    const float median = sample[sample.size() / 2];
+    const float base = std::max({median, peak * 1e-9f, 1e-9f});
+    rangeStops = static_cast<float>(std::log2(peak / base));
 }

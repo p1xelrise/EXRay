@@ -3,6 +3,22 @@
 
 Everything added so far, newest first.
 
+v0.10.0 beta: Studio
+--------------------
+- New Studio layout: your folders on the left, the grid or image in the middle, an inspector on the right.
+- Folder library: "+ Add" folders from any drive. They show as a tree with file counts and stay there next time.
+  - Right-click a folder for Show in Explorer, Rescan, Include subfolders and Remove from EXRay.
+  - Removing never deletes files, asks first, and Ctrl+Z brings the folder back.
+  - EXRay watches the folders, so new or changed files appear by themselves. A folder on an unplugged drive is shown as "not found" until it's back.
+- Search (Ctrl+F): file names across all your folders, or only the folder you're in. Each folder shows how many matches it has.
+- Inspector: preview, size, format, file size, date, brightest value and range of the selected image, with Open, Fix HDRI, Sun check, 360° view and Show in Explorer.
+- Fix HDRI is now a panel beside the image instead of a separate window, so you see the image while you choose. Apply, change the sky, apply again.
+- "Include subfolders" above the grid shows the files of all subfolders together.
+- Ctrl+B hides or shows the folders panel, Ctrl+I the inspector. On narrow windows the panels make room for the image.
+- New logo and app icon: Horizon Sun.
+- Help menu: Sponsor on GitHub, Support on Gumroad.
+- The folder that was open last time opens again at start.
+
 v0.9.8 beta: Open source
 ------------------------
 - EXRay is open source under the GNU GPL v3 (or later). The source code is on GitHub: https://github.com/p1xelrise/EXRay

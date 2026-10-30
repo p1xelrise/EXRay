@@ -63,12 +63,14 @@ struct State {
     std::wstring fileName;
     HdriReport report;
     HdriFixOptions opts;
-    FixWindowResult result = FixWindowResult::Cancel;
-    bool done = false;
+    HWND parent = nullptr;
+    bool loaded = false;          // a report has been shown
     UINT dpi = 96;
     HFONT titleFont = nullptr, headerFont = nullptr, bodyFont = nullptr, boldFont = nullptr, smallFont = nullptr;
-    int margin = 0, width = 0, footerH = 0, height = 0;
+    int margin = 0, width = 0, footerH = 0, height = 0;   // height = content height (scrolls)
+    int scroll = 0, viewH = 0;    // the content scrolls above the footer
     std::wstring subtitle;
+    int subtitleH = 0;
     RECT foundHeader{}, fixHeader{};
     std::vector<Finding> findings;
     std::vector<Check> checks;    // 0 = sun, 1 = broken, 2 = hot
@@ -102,7 +104,10 @@ struct State {
         else if (choice == kChoiceSize) opts.sunSizeDeg = kSizes[std::clamp(k, 0, 3)];
         else opts.sunColor = k == 1 ? SunColorMode::Natural : SunColorMode::Glow;
     }
-    ~State() { for (HFONT f : {titleFont, headerFont, bodyFont, boldFont, smallFont}) if (f) DeleteObject(f); }
+    void FreeFonts() {
+        for (HFONT* f : {&titleFont, &headerFont, &bodyFont, &boldFont, &smallFont}) { if (*f) DeleteObject(*f); *f = nullptr; }
+    }
+    ~State() { FreeFonts(); }
 };
 
 HFONT MakeFont(int px, int weight) {
@@ -231,10 +236,11 @@ void BuildText(State& st) {
     st.choices = {
         {L"Sky", {L"Clear", L"Light haze", L"Hazy"}, {64, 92, 64}, {}, {}},
         {L"Size", {L"Real 0.53°", L"1°", L"2°", L"4°"}, {92, 44, 44, 44}, {}, {}},
-        {L"Colour", {L"From the glow", L"Natural for its height"}, {112, 164}, {}, {}},
+        {L"Colour", {L"From the glow", L"Natural"}, {120, 84}, {}, {}},
     };
 
-    st.footNote = r.AnythingToFix() ? L"Fixes show on screen first; Ctrl+S saves a copy. The original is never changed."
+    st.footNote = r.AnythingToFix() ? L"Fixes show on the image first; B shows before / after and Ctrl+S saves a copy. "
+                                      L"The original file is never changed."
                                     : L"Nothing here needs fixing.";
 }
 
@@ -248,15 +254,22 @@ int WrappedH(HDC dc, HFONT f, const std::wstring& t, int width) {
 
 const wchar_t kSunNote[] = L"Pick the sky you see around the sun: deep blue and a crisp sun = Clear; pale or milky = "
                            L"Light haze or Hazy. Haze moves light from the sun to the sky, so the same sky means a weaker "
-                           L"sun. A bigger sun gives softer shadows with the same total light. A lamp indoors: untick this.";
+                           L"sun. Natural colour = daylight for the sun's height. A bigger sun gives softer shadows with the same total "
+                           L"light. A lamp indoors: untick this.";
 
+// Lays the panel out for its current width. Choice rows put their label above
+// the buttons, and the buttons shrink to fit a narrow panel.
 void Layout(HWND hwnd, State& st) {
     HDC dc = GetDC(hwnd);
-    st.margin = st.S(28);
-    st.width = st.S(660);
-    st.footerH = st.S(64);
+    RECT cr;
+    GetClientRect(hwnd, &cr);
+    st.margin = st.S(18);
+    st.width = std::max<int>(cr.right, st.S(200));
+    st.footerH = st.S(58);
     const int inner = st.width - 2 * st.margin;
-    int y = st.margin + st.S(30) + st.S(22) + st.S(12);
+    int y = st.margin + st.S(30);
+    st.subtitleH = WrappedH(dc, st.bodyFont, st.subtitle, inner);
+    y += st.subtitleH + st.S(12);
 
     st.foundHeader = {st.margin, y, st.width - st.margin, y + st.S(30)};
     y += st.S(36);
@@ -271,31 +284,49 @@ void Layout(HWND hwnd, State& st) {
     st.fixHeader = {st.margin, y, st.width - st.margin, y + st.S(30)};
     y += st.S(38);
     const int boxW = st.S(18), textX = st.margin + boxW + st.S(12);
+    const int avail = st.width - st.margin - textX;
     for (size_t i = 0; i < st.checks.size(); ++i) {
         Check& c = st.checks[i];
         const int top = y;
         c.box = {st.margin, y + st.S(1), st.margin + boxW, y + st.S(1) + boxW};
         y += st.S(22);
-        y += WrappedH(dc, st.smallFont, c.note, st.width - st.margin - textX) + st.S(4);
+        y += WrappedH(dc, st.smallFont, c.note, avail) + st.S(4);
         if (i == 0 && st.showSun) {
             y += st.S(6);
             for (size_t g = 0; g < st.choices.size(); ++g) {
                 Choice& ch = st.choices[g];
-                ch.labelR = {textX, y, textX + st.S(78), y + st.S(28)};
-                int x = ch.labelR.right;
+                ch.labelR = {textX, y, st.width - st.margin, y + st.S(20)};
+                y += st.S(22);
+                int total = 0;
+                for (int w : ch.widths) total += st.S(w);
+                const double k = total > avail ? static_cast<double>(avail) / total : 1.0;
+                int x = textX;
                 ch.segs.clear();
-                for (int w : ch.widths) { ch.segs.push_back(RECT{x, y, x + st.S(w), y + st.S(28)}); x += st.S(w); }
-                if (g == kChoiceSky) st.peakText = {x + st.S(14), y, st.width - st.margin, y + st.S(28)};
+                for (size_t n = 0; n < ch.widths.size(); ++n) {
+                    int w = static_cast<int>(st.S(ch.widths[n]) * k);
+                    if (n + 1 == ch.widths.size() && k < 1.0) w = textX + avail - x;   // fill exactly
+                    ch.segs.push_back(RECT{x, y, x + w, y + st.S(28)});
+                    x += w;
+                }
                 y += st.S(34);
+                if (g == kChoiceSky) {
+                    st.peakText = {textX, y - st.S(4), st.width - st.margin, y + st.S(18)};
+                    y += st.S(24);
+                }
             }
-            const int nh = WrappedH(dc, st.smallFont, kSunNote, st.width - st.margin - textX);
+            const int nh = WrappedH(dc, st.smallFont, kSunNote, avail);
             st.sunNote = {textX, y, st.width - st.margin, y + nh};
             y += nh;
         }
         c.row = {st.margin, top, st.width - st.margin, y};
         y += st.S(14);
     }
-    st.height = y + st.S(4) + st.footerH;
+    const int fh = WrappedH(dc, st.smallFont, st.footNote, inner);
+    st.footRect = {st.margin, y, st.width - st.margin, y + fh};
+    y += fh + st.margin;
+    st.height = y;
+    st.viewH = std::max<int>(0, cr.bottom - st.footerH);
+    st.scroll = std::clamp(st.scroll, 0, std::max(0, st.height - st.viewH));
     ReleaseDC(hwnd, dc);
 }
 
@@ -338,6 +369,7 @@ void Paint(HWND hwnd, State& st) {
     HDC wdc = BeginPaint(hwnd, &ps);
     RECT cr;
     GetClientRect(hwnd, &cr);
+    if (cr.right <= 0 || cr.bottom <= 0) { EndPaint(hwnd, &ps); return; }
     HDC dc = CreateCompatibleDC(wdc);
     HBITMAP bmp = CreateCompatibleBitmap(wdc, cr.right, cr.bottom);
     HGDIOBJ oldBmp = SelectObject(dc, bmp);
@@ -345,96 +377,109 @@ void Paint(HWND hwnd, State& st) {
     HBRUSH bg = CreateSolidBrush(kBg);
     FillRect(dc, &cr, bg);
     DeleteObject(bg);
+    RECT edge{0, 0, 1, cr.bottom};
+    HBRUSH eb = CreateSolidBrush(kRule);
+    FillRect(dc, &edge, eb);
+    DeleteObject(eb);
 
-    int y = st.margin;
-    Text(dc, st.titleFont, kTitle, L"Fix HDRI", RECT{st.margin, y, cr.right - st.margin, y + st.S(30)},
-         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    y += st.S(30);
-    Text(dc, st.bodyFont, kDim, st.subtitle, RECT{st.margin, y, cr.right - st.margin, y + st.S(22)},
-         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_PATH_ELLIPSIS);
+    if (st.loaded) {
+        // The content scrolls; the footer with the buttons stays put.
+        const int saved = SaveDC(dc);
+        IntersectClipRect(dc, 0, 0, cr.right, st.viewH);
+        SetViewportOrgEx(dc, 0, -st.scroll, nullptr);
 
-    // What was found: a coloured dot per line.
-    Header(dc, st, st.foundHeader, L"What was found");
-    for (const Finding& f : st.findings) {
-        const COLORREF mc = f.mark == Mark::Ok ? kOk : f.mark == Mark::Warn ? kWarn : f.mark == Mark::Bad ? kBad : kDim;
-        const int d = st.S(8), cy = f.r.top + st.S(9);
-        FillRound(dc, RECT{f.r.left + st.S(2), cy - d / 2, f.r.left + st.S(2) + d, cy + d / 2}, mc, mc, d / 2);
-        Text(dc, st.bodyFont, kBody, f.text, RECT{f.r.left + st.S(22), f.r.top, f.r.right, f.r.bottom}, DT_LEFT | DT_WORDBREAK);
-    }
+        int y = st.margin;
+        Text(dc, st.titleFont, kTitle, L"Fix HDRI", RECT{st.margin, y, cr.right - st.margin, y + st.S(30)},
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        y += st.S(30);
+        Text(dc, st.bodyFont, kDim, st.subtitle, RECT{st.margin, y, cr.right - st.margin, y + st.subtitleH}, DT_LEFT | DT_WORDBREAK);
 
-    // Fixes: check boxes (the whole row is clickable).
-    Header(dc, st, st.fixHeader, L"Fixes");
-    for (size_t i = 0; i < st.checks.size(); ++i) {
-        const Check& c = st.checks[i];
-        const bool on = c.enabled && *c.value;
-        const bool hot = c.enabled && st.hot == kCheckBase + static_cast<int>(i);
-        const COLORREF boxFill = on ? (hot ? kAccentHot : kAccent) : (hot ? kButtonHot : kButton);
-        FillRound(dc, c.box, c.enabled ? boxFill : kBg, c.enabled ? (on ? boxFill : RGB(0x5a, 0x5a, 0x5a)) : kRule, st.S(3));
-        if (on) {   // tick mark
-            HPEN pen = CreatePen(PS_SOLID, std::max(2, st.S(2)), RGB(0xff, 0xff, 0xff));
-            HGDIOBJ op = SelectObject(dc, pen);
-            const int bx = c.box.left, by = c.box.top, s = c.box.right - c.box.left;
-            POINT pts[3] = {{bx + s * 22 / 100, by + s * 52 / 100}, {bx + s * 42 / 100, by + s * 72 / 100},
-                            {bx + s * 78 / 100, by + s * 30 / 100}};
-            Polyline(dc, pts, 3);
-            SelectObject(dc, op);
-            DeleteObject(pen);
+        Header(dc, st, st.foundHeader, L"What was found");
+        for (const Finding& f : st.findings) {
+            const COLORREF mc = f.mark == Mark::Ok ? kOk : f.mark == Mark::Warn ? kWarn : f.mark == Mark::Bad ? kBad : kDim;
+            const int d = st.S(8), cy = f.r.top + st.S(9);
+            FillRound(dc, RECT{f.r.left + st.S(2), cy - d / 2, f.r.left + st.S(2) + d, cy + d / 2}, mc, mc, d / 2);
+            Text(dc, st.bodyFont, kBody, f.text, RECT{f.r.left + st.S(22), f.r.top, f.r.right, f.r.bottom}, DT_LEFT | DT_WORDBREAK);
         }
-        const int tx = c.box.right + st.S(12);
-        Text(dc, st.boldFont, c.enabled ? kHeader : kOff, c.label + (c.enabled ? L"" : L"  (nothing to fix)"),
-             RECT{tx, c.row.top, c.row.right, c.row.top + st.S(22)}, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        Text(dc, st.smallFont, c.enabled ? kDim : kOff, c.note, RECT{tx, c.row.top + st.S(22), c.row.right, c.row.bottom},
-             DT_LEFT | DT_WORDBREAK);
 
-        if (i == 0 && st.showSun) {
-            const bool en = st.opts.rebuildSun;
-            for (size_t g = 0; g < st.choices.size(); ++g) {
-                const Choice& ch = st.choices[g];
-                Text(dc, st.bodyFont, en ? kBody : kOff, ch.label, ch.labelR, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-                RECT group{ch.segs.front().left, ch.segs.front().top, ch.segs.back().right, ch.segs.front().bottom};
-                FillRound(dc, group, kButton, kButton, st.S(5));
-                const int sel = st.Selected(static_cast<int>(g));
-                for (size_t k = 0; k < ch.segs.size(); ++k) {
-                    RECT r = ch.segs[k];
-                    InflateRect(&r, -std::max(2, st.S(2)), -std::max(2, st.S(2)));
-                    const bool h = en && st.hot == SegId(static_cast<int>(g), static_cast<int>(k));
-                    const COLORREF on2 = en ? (h ? kAccentHot : kAccent) : RGB(0x4a, 0x4a, 0x4a);
-                    if (static_cast<int>(k) == sel) FillRound(dc, r, on2, on2, st.S(4));
-                    else if (h) FillRound(dc, r, kButtonHot, kButtonHot, st.S(4));
-                    Text(dc, st.bodyFont, en ? kHeader : kOff, ch.items[k], ch.segs[k], DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-                }
+        Header(dc, st, st.fixHeader, L"Fixes");
+        for (size_t i = 0; i < st.checks.size(); ++i) {
+            const Check& c = st.checks[i];
+            const bool on = c.enabled && *c.value;
+            const bool hot = c.enabled && st.hot == kCheckBase + static_cast<int>(i);
+            const COLORREF boxFill = on ? (hot ? kAccentHot : kAccent) : (hot ? kButtonHot : kButton);
+            FillRound(dc, c.box, c.enabled ? boxFill : kBg, c.enabled ? (on ? boxFill : RGB(0x5a, 0x5a, 0x5a)) : kRule, st.S(3));
+            if (on) {   // tick mark
+                HPEN pen = CreatePen(PS_SOLID, std::max(2, st.S(2)), RGB(0xff, 0xff, 0xff));
+                HGDIOBJ op = SelectObject(dc, pen);
+                const int bx = c.box.left, by = c.box.top, sz = c.box.right - c.box.left;
+                POINT pts[3] = {{bx + sz * 22 / 100, by + sz * 52 / 100}, {bx + sz * 42 / 100, by + sz * 72 / 100},
+                                {bx + sz * 78 / 100, by + sz * 30 / 100}};
+                Polyline(dc, pts, 3);
+                SelectObject(dc, op);
+                DeleteObject(pen);
             }
-            wchar_t buf[96];
-            std::swprintf(buf, std::size(buf), L"→   sun about %ls",
-                          Num(SunPeakAt(st.report, SkyEV(st.opts.sky) + st.opts.sunStrengthEV, st.opts.sunSizeDeg)).c_str());
-            Text(dc, st.bodyFont, en ? kBody : kOff, buf, st.peakText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            Text(dc, st.smallFont, en ? kDim : kOff, kSunNote, st.sunNote, DT_LEFT | DT_WORDBREAK);
-        }
-    }
+            const int tx = c.box.right + st.S(12);
+            Text(dc, st.boldFont, c.enabled ? kHeader : kOff, c.label + (c.enabled ? L"" : L"  (nothing to fix)"),
+                 RECT{tx, c.row.top, c.row.right, c.row.top + st.S(22)}, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            Text(dc, st.smallFont, c.enabled ? kDim : kOff, c.note, RECT{tx, c.row.top + st.S(22), c.row.right, c.row.bottom},
+                 DT_LEFT | DT_WORDBREAK);
 
-    // Footer: a note on the left; Sun check, Cancel and Apply on the right.
-    const int bottom = cr.bottom - st.footerH;
-    RECT fr{0, bottom, cr.right, cr.bottom};
-    HBRUSH fb = CreateSolidBrush(kFooter);
-    FillRect(dc, &fr, fb);
-    DeleteObject(fb);
-    const int bh = st.S(32), by = bottom + (st.footerH - bh) / 2;
-    const bool anything = st.report.AnythingToFix();
-    int right = cr.right - st.margin;
-    st.apply = RECT{};
-    if (anything) { st.apply = {right - st.S(116), by, right, by + bh}; right = st.apply.left - st.S(8); }
-    st.cancel = {right - st.S(88), by, right, by + bh};
-    right = st.cancel.left - st.S(8);
-    st.sunCheck = RECT{};
-    if (st.canSunCheck) { st.sunCheck = {right - st.S(100), by, right, by + bh}; right = st.sunCheck.left - st.S(8); }
-    if (anything) Button(dc, st, st.apply, L"Apply fixes", true, st.CanApply(), st.hot == kApply);
-    Button(dc, st, st.cancel, anything ? L"Cancel" : L"Close", false, true, st.hot == kCancel);
-    if (st.canSunCheck) Button(dc, st, st.sunCheck, L"Sun check", false, true, st.hot == kSunCheck);
-    // The note may wrap to two lines; DT_VCENTER only works for one, so centre it by hand.
-    const int noteW = right - st.S(8) - st.margin;
-    const int noteH = WrappedH(dc, st.smallFont, st.footNote, noteW);
-    st.footRect = {st.margin, bottom + (st.footerH - noteH) / 2, st.margin + noteW, bottom + (st.footerH + noteH) / 2};
-    Text(dc, st.smallFont, kDim, st.footNote, st.footRect, DT_LEFT | DT_WORDBREAK);
+            if (i == 0 && st.showSun) {
+                const bool en = st.opts.rebuildSun;
+                for (size_t g = 0; g < st.choices.size(); ++g) {
+                    const Choice& ch = st.choices[g];
+                    Text(dc, st.smallFont, en ? kDim : kOff, ch.label, ch.labelR, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                    RECT group{ch.segs.front().left, ch.segs.front().top, ch.segs.back().right, ch.segs.front().bottom};
+                    FillRound(dc, group, kButton, kButton, st.S(5));
+                    const int sel = st.Selected(static_cast<int>(g));
+                    for (size_t k = 0; k < ch.segs.size(); ++k) {
+                        RECT r = ch.segs[k];
+                        InflateRect(&r, -std::max(2, st.S(2)), -std::max(2, st.S(2)));
+                        const bool h = en && st.hot == SegId(static_cast<int>(g), static_cast<int>(k));
+                        const COLORREF on2 = en ? (h ? kAccentHot : kAccent) : RGB(0x4a, 0x4a, 0x4a);
+                        if (static_cast<int>(k) == sel) FillRound(dc, r, on2, on2, st.S(4));
+                        else if (h) FillRound(dc, r, kButtonHot, kButtonHot, st.S(4));
+                        Text(dc, st.bodyFont, en ? kHeader : kOff, ch.items[k], ch.segs[k],
+                             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                    }
+                }
+                wchar_t buf[96];
+                std::swprintf(buf, std::size(buf), L"Sun brightness  →  about %ls",
+                              Num(SunPeakAt(st.report, SkyEV(st.opts.sky) + st.opts.sunStrengthEV, st.opts.sunSizeDeg)).c_str());
+                Text(dc, st.bodyFont, en ? kBody : kOff, buf, st.peakText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                Text(dc, st.smallFont, en ? kDim : kOff, kSunNote, st.sunNote, DT_LEFT | DT_WORDBREAK);
+            }
+        }
+        Text(dc, st.smallFont, kDim, st.footNote, st.footRect, DT_LEFT | DT_WORDBREAK);
+        RestoreDC(dc, saved);
+
+        // Scroll indicator.
+        if (st.height > st.viewH && st.viewH > 0) {
+            const int thumbH = std::max(st.S(24), st.viewH * st.viewH / st.height);
+            const int maxScroll = st.height - st.viewH;
+            const int ty = (st.viewH - thumbH) * st.scroll / std::max(1, maxScroll);
+            FillRound(dc, RECT{cr.right - st.S(5), ty + st.S(2), cr.right - st.S(2), ty + thumbH - st.S(2)}, kButtonHot, kButtonHot, st.S(1));
+        }
+
+        // Footer: Sun check on the left, Close and Apply on the right.
+        const int bottom = cr.bottom - st.footerH;
+        RECT fr{1, bottom, cr.right, cr.bottom};
+        HBRUSH fb = CreateSolidBrush(kFooter);
+        FillRect(dc, &fr, fb);
+        DeleteObject(fb);
+        const int bh = st.S(32), by = bottom + (st.footerH - bh) / 2, m = st.S(14);
+        const bool anything = st.report.AnythingToFix();
+        int right = cr.right - m;
+        st.apply = RECT{};
+        if (anything) { st.apply = {right - st.S(92), by, right, by + bh}; right = st.apply.left - st.S(8); }
+        st.cancel = {right - st.S(72), by, right, by + bh};
+        st.sunCheck = RECT{};
+        if (st.canSunCheck) st.sunCheck = {m, by, std::min<int>(m + st.S(96), st.cancel.left - st.S(8)), by + bh};
+        if (anything) Button(dc, st, st.apply, L"Apply", true, st.CanApply(), st.hot == kApply);
+        Button(dc, st, st.cancel, L"Close", false, true, st.hot == kCancel);
+        if (st.canSunCheck) Button(dc, st, st.sunCheck, L"Sun check", false, true, st.hot == kSunCheck);
+    }
 
     BitBlt(wdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
     SelectObject(dc, oldBmp);
@@ -444,9 +489,14 @@ void Paint(HWND hwnd, State& st) {
 }
 
 int HitTest(const State& st, POINT p) {
-    if (st.report.AnythingToFix() && PtInRect(&st.apply, p)) return kApply;
-    if (PtInRect(&st.cancel, p)) return kCancel;
-    if (st.canSunCheck && PtInRect(&st.sunCheck, p)) return kSunCheck;
+    if (!st.loaded) return kNone;
+    if (p.y >= st.viewH) {   // the footer does not scroll
+        if (st.report.AnythingToFix() && PtInRect(&st.apply, p)) return kApply;
+        if (PtInRect(&st.cancel, p)) return kCancel;
+        if (st.canSunCheck && PtInRect(&st.sunCheck, p)) return kSunCheck;
+        return kNone;
+    }
+    p.y += st.scroll;
     if (st.showSun && st.opts.rebuildSun)
         for (size_t g = 0; g < st.choices.size(); ++g)
             for (size_t k = 0; k < st.choices[g].segs.size(); ++k)
@@ -460,23 +510,35 @@ int HitTest(const State& st, POINT p) {
     return kNone;
 }
 
+void Notify(State& st, FixWindowResult r) {
+    if (st.parent) PostMessageW(st.parent, WM_APP_FIXPANEL, static_cast<WPARAM>(r), 0);
+}
+
 void Click(HWND hwnd, State& st, int target) {
     if (target == kApply) {
         if (!st.CanApply()) { MessageBeep(MB_OK); return; }
-        st.result = FixWindowResult::Apply;
-        DestroyWindow(hwnd);
+        Notify(st, FixWindowResult::Apply);
     } else if (target == kCancel) {
-        DestroyWindow(hwnd);
+        Notify(st, FixWindowResult::Cancel);
     } else if (target == kSunCheck) {
-        st.result = FixWindowResult::SunCheck;
-        DestroyWindow(hwnd);
+        Notify(st, FixWindowResult::SunCheck);
     } else if (target >= kSegBase && target < kCheckBase) {
         st.Select((target - kSegBase) / 16, (target - kSegBase) % 16);
     } else if (target >= kCheckBase) {
         Check& c = st.checks[static_cast<size_t>(target - kCheckBase)];
         *c.value = !*c.value;
+        Layout(hwnd, st);
     }
     InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+void MakeFonts(State& st) {
+    st.FreeFonts();
+    st.titleFont = MakeFont(st.S(20), FW_SEMIBOLD);
+    st.headerFont = MakeFont(st.S(15), FW_SEMIBOLD);
+    st.bodyFont = MakeFont(st.S(13), FW_NORMAL);
+    st.boldFont = MakeFont(st.S(13), FW_SEMIBOLD);
+    st.smallFont = MakeFont(st.S(12), FW_NORMAL);
 }
 
 LRESULT CALLBACK FixProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -485,11 +547,26 @@ LRESULT CALLBACK FixProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_NCCREATE:
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams));
             break;
+        case WM_NCDESTROY:
+            delete st;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            break;
         case WM_ERASEBKGND:
             return 1;
+        case WM_SIZE:
+            if (st && st->loaded) Layout(hwnd, *st);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
         case WM_PAINT:
             if (st) { Paint(hwnd, *st); return 0; }
             break;
+        case WM_MOUSEWHEEL:
+            if (st && st->height > st->viewH) {
+                const int step = -GET_WHEEL_DELTA_WPARAM(wp) * st->S(48) / WHEEL_DELTA;
+                const int s = std::clamp(st->scroll + step, 0, st->height - st->viewH);
+                if (s != st->scroll) { st->scroll = s; st->hot = kNone; InvalidateRect(hwnd, nullptr, FALSE); }
+            }
+            return 0;
         case WM_MOUSEMOVE:
             if (st) {
                 const int h = HitTest(*st, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
@@ -505,6 +582,7 @@ LRESULT CALLBACK FixProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (st && LOWORD(lp) == HTCLIENT && st->hot != kNone) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
             break;
         case WM_LBUTTONDOWN:
+        case WM_LBUTTONDBLCLK:
             if (st) st->pressed = HitTest(*st, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             return 0;
         case WM_LBUTTONUP:
@@ -515,94 +593,63 @@ LRESULT CALLBACK FixProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (h != kNone && h == was) Click(hwnd, *st, h);
             }
             return 0;
-        case WM_KEYDOWN:
-            if (!st) break;
-            if (wp == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
-            if (wp == VK_RETURN) { if (st->report.AnythingToFix()) Click(hwnd, *st, kApply); else DestroyWindow(hwnd); return 0; }
-            if (wp == '1' || wp == '2' || wp == '3') {   // toggle a fix from the keyboard
-                const size_t i = static_cast<size_t>(wp - '1');
-                if (i < st->checks.size() && st->checks[i].enabled) Click(hwnd, *st, kCheckBase + static_cast<int>(i));
-                return 0;
-            }
-            if ((wp == VK_LEFT || wp == VK_RIGHT) && st->showSun && st->opts.rebuildSun) {   // sky
-                st->Select(kChoiceSky, st->Selected(kChoiceSky) + (wp == VK_LEFT ? -1 : 1));
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            break;
-        case WM_DESTROY:
-            if (st) st->done = true;
-            return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 }  // namespace
 
-FixWindowResult ShowFixWindow(HWND owner, const std::wstring& fileName, const HdriReport& report, HdriFixOptions& opts) {
+HWND CreateFixPanel(HWND parent) {
     static bool registered = false;
     HINSTANCE inst = GetModuleHandleW(nullptr);
     if (!registered) {
         WNDCLASSEXW wc = {};
         wc.cbSize = sizeof(wc);
+        wc.style = CS_DBLCLKS;
         wc.lpfnWndProc = FixProc;
         wc.hInstance = inst;
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
         wc.lpszClassName = kClass;
         RegisterClassExW(&wc);
         registered = true;
     }
+    auto* st = new State();
+    st->parent = parent;
+    st->dpi = GetDpiForWindow(parent);
+    HWND hwnd = CreateWindowExW(0, kClass, L"Fix HDRI", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 10, 10, parent, nullptr, inst, st);
+    if (!hwnd) delete st;
+    return hwnd;
+}
 
-    auto st = std::make_unique<State>();
+void FixPanelShow(HWND panel, const std::wstring& fileName, const HdriReport& report, const HdriFixOptions& opts) {
+    State* st = reinterpret_cast<State*>(GetWindowLongPtrW(panel, GWLP_USERDATA));
+    if (!st) return;
+    st->dpi = GetDpiForWindow(st->parent);
+    MakeFonts(*st);
     st->fileName = fileName;
     st->report = report;
     st->opts = opts;
-    st->dpi = owner ? GetDpiForWindow(owner) : GetDpiForSystem();
-    st->titleFont = MakeFont(st->S(22), FW_SEMIBOLD);
-    st->headerFont = MakeFont(st->S(15), FW_SEMIBOLD);
-    st->bodyFont = MakeFont(st->S(13), FW_NORMAL);
-    st->boldFont = MakeFont(st->S(13), FW_SEMIBOLD);
-    st->smallFont = MakeFont(st->S(12), FW_NORMAL);
+    st->findings.clear();
+    st->checks.clear();
+    st->choices.clear();
+    st->scroll = 0;
+    st->hot = st->pressed = kNone;
     BuildText(*st);
+    st->loaded = true;
+    Layout(panel, *st);
+    InvalidateRect(panel, nullptr, FALSE);
+}
 
-    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
-    HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, kClass, L"Fix HDRI", style, 0, 0, 100, 100, owner, nullptr, inst, st.get());
-    if (!hwnd) return FixWindowResult::Cancel;
-    BOOL dark = TRUE;
-    using DwmSetAttr = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
-    if (HMODULE dwm = LoadLibraryW(L"dwmapi.dll"))
-        if (auto fn = reinterpret_cast<DwmSetAttr>(GetProcAddress(dwm, "DwmSetWindowAttribute")))
-            fn(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+void FixPanelDpiChanged(HWND panel) {
+    State* st = reinterpret_cast<State*>(GetWindowLongPtrW(panel, GWLP_USERDATA));
+    if (!st || !st->loaded) return;
+    st->dpi = GetDpiForWindow(st->parent);
+    MakeFonts(*st);
+    Layout(panel, *st);
+    InvalidateRect(panel, nullptr, FALSE);
+}
 
-    Layout(hwnd, *st);
-    RECT frame{0, 0, st->width, st->height};
-    AdjustWindowRectExForDpi(&frame, style, FALSE, WS_EX_DLGMODALFRAME, st->dpi);
-    const int ww = frame.right - frame.left, wh = frame.bottom - frame.top;
-    RECT ownerRect{0, 0, 1280, 800};
-    if (owner) GetWindowRect(owner, &ownerRect);
-    MONITORINFO mi = {};
-    mi.cbSize = sizeof(mi);
-    GetMonitorInfoW(MonitorFromRect(&ownerRect, MONITOR_DEFAULTTONEAREST), &mi);
-    int x = (ownerRect.left + ownerRect.right - ww) / 2, y = (ownerRect.top + ownerRect.bottom - wh) / 2;
-    x = std::clamp(x, static_cast<int>(mi.rcWork.left), std::max(static_cast<int>(mi.rcWork.left), static_cast<int>(mi.rcWork.right) - ww));
-    y = std::clamp(y, static_cast<int>(mi.rcWork.top), std::max(static_cast<int>(mi.rcWork.top), static_cast<int>(mi.rcWork.bottom) - wh));
-    SetWindowPos(hwnd, nullptr, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
-
-    if (owner) EnableWindow(owner, FALSE);
-    ShowWindow(hwnd, SW_SHOW);
-    SetFocus(hwnd);
-    MSG m;
-    bool quit = false;
-    while (!st->done) {
-        const BOOL r = GetMessageW(&m, nullptr, 0, 0);
-        if (r <= 0) { quit = true; break; }
-        TranslateMessage(&m);
-        DispatchMessageW(&m);
-    }
-    if (owner) { EnableWindow(owner, TRUE); SetActiveWindow(owner); }
-    if (IsWindow(hwnd)) DestroyWindow(hwnd);
-    if (quit) PostQuitMessage(static_cast<int>(m.wParam));
-    if (st->result != FixWindowResult::Cancel) opts = st->opts;
-    return st->result;
+HdriFixOptions FixPanelOptions(HWND panel) {
+    State* st = reinterpret_cast<State*>(GetWindowLongPtrW(panel, GWLP_USERDATA));
+    return st ? st->opts : HdriFixOptions{};
 }

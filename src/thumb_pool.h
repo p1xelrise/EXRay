@@ -24,6 +24,9 @@ struct ThumbResult {
     int imageWidth = 0, imageHeight = 0;
     std::string format;
     Thumbnail thumb;
+    float peakLum = 0.0f;       // brightest luminance and range in stops (ImageQuickStats)
+    float rangeStops = 0.0f;
+    bool statsReduced = false;  // measured on a shrunk copy (very large .hdr): the peak is approximate
 };
 
 class ThumbPool {

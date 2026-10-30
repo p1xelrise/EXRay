@@ -26,7 +26,7 @@ OPT=(-O2 -DNDEBUG -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00)
 "$CC"  "${OPT[@]}" "${INC[@]}" -w -c "$ROOT/third_party/tinyexr/deps/miniz/miniz.c" -o "$OUT/miniz.o"
 "$CXX" "${OPT[@]}" "${INC[@]}" -std=c++17 -w -c "$ROOT/src/image_io.cpp" -o "$OUT/image_io.o"
 OBJS=("$OUT/image_io.o" "$OUT/miniz.o" "$OUT/app_res.o")
-for src in tonemap resample thumbnail thumb_pool exr_doc export batch_export hdri_fix fix_window settings_win display_win folder_nav toolbar grid_view info_window pano main_win; do
+for src in tonemap resample thumbnail thumb_pool exr_doc export batch_export hdri_fix fix_window library side_panels settings_win display_win folder_nav toolbar grid_view info_window pano main_win; do
   "$CXX" "${OPT[@]}" "${INC[@]}" -std=c++17 -Wall -Wextra -c "$ROOT/src/$src.cpp" -o "$OUT/$src.o"
   OBJS+=("$OUT/$src.o")
 done
