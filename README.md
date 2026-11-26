@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/images/hero.jpg" alt="EXRay showing a folder of HDRIs as thumbnails" width="100%"></p>
+<p align="center"><img src="docs/images/studio.jpg" alt="EXRay: the folders panel, a grid of HDRI thumbnails and the inspector" width="100%"></p>
 
 # EXRay
 
@@ -29,6 +29,7 @@ Photoshop. One small portable `.exe`, nothing to install, works fully offline.
 
 | | |
 |---|---|
+| ![Search across all folders](docs/images/search.jpg) | ![Fix HDRI panel](docs/images/fix_panel.jpg) |
 | ![Grid of HDRIs](docs/images/grid.jpg) | ![360° view](docs/images/360.jpg) |
 | ![Render passes](docs/images/passes.jpg) | ![Cryptomatte](docs/images/cryptomatte.jpg) |
 
