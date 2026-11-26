@@ -29,7 +29,10 @@ b = io.BytesIO(); ic.save(b, "PNG", optimize=True)
 ICON = "data:image/png;base64," + base64.b64encode(b.getvalue()).decode()
 
 def build_shots():
-    return {k: webp(f"shot_{k}.png") for k in ["image", "grid", "360", "fix", "passes", "crypto", "mask"]}
+    S = {k: webp(f"shot_{k}.png") for k in ["360", "passes", "crypto", "mask"]}
+    # Studio-layout screenshots have small UI text: keep them sharper.
+    S.update({k: webp(f"shot_{k}.png", q=max(QUALITY, 80), width=max(WIDTH, 1600)) for k in ["studio", "search", "fixpanel"]})
+    return S
 import re, glob
 # Version from main_win.cpp, checksum of the packed .exe (run tools/package.sh first).
 VERSION = re.search(r'kVersion\[\] *= *L"([^"]*)"', open(os.path.join(ROOT, "src", "main_win.cpp"), encoding="utf-8").read()).group(1)
@@ -73,7 +76,7 @@ img{max-width:100%;height:auto;display:block}
              radial-gradient(ellipse 45% 40% at 78% 10%,var(--glowB),transparent 70%);pointer-events:none}
 .hero>*{position:relative}
 .brand{display:inline-flex;align-items:center;gap:18px;margin:0}
-.brand img{width:76px;height:76px;filter:drop-shadow(0 10px 25px rgba(246,166,90,.35))}
+.brand img{width:76px;height:76px;filter:drop-shadow(0 10px 25px rgba(47,111,214,.40))}
 h1{font-size:clamp(52px,9vw,92px);line-height:1;margin:0;letter-spacing:-.03em;font-weight:800}
 .tag{font-size:clamp(20px,2.6vw,28px);font-weight:650;margin:22px 0 8px;letter-spacing:-.01em}
 .sub{color:var(--dim);max-width:640px;margin:0 auto}
@@ -162,13 +165,13 @@ footer .heart{color:#e04a5a}
   <div class="wrap">
     <div class="brand"><img src="@ICON@" alt="" width="76" height="76"><h1>EXRay</h1></div>
     <p class="tag">The fast HDR &amp; EXR viewer for 3D artists</p>
-    <p class="sub">Browse, inspect and fix your HDRIs and EXR renders as easily as JPGs — one small portable app for Windows 11, no Photoshop needed.</p>
+    <p class="sub">All your HDRI and EXR folders in one place. Browse, search, inspect and fix them as easily as JPGs — one small portable app for Windows 11, no Photoshop needed.</p>
     <div class="cta">
       <a class="btn btn-primary" data-gumroad-action="buy" data-gumroad-price="0" href="#support">Download free</a>
       <a class="btn btn-ghost" href="#support">Support with a tip</a>
     </div>
     <p class="meta"><span>Free for everyone</span><span>Windows 11, 64-bit</span><span>~2 MB, nothing to install</span><span>v@VERSION@</span></p>
-    <div class="shot reveal"><img src="@S_image@" alt="EXRay showing an 8K sunset HDRI with exposure and tonemap controls" width="1280" height="720"></div>
+    <div class="shot reveal"><img src="@S_studio@" alt="EXRay with the folders panel, a grid of HDRI thumbnails and the inspector" width="1600" height="801"></div>
   </div>
 </header>
 
@@ -177,12 +180,12 @@ footer .heart{color:#e04a5a}
     <div class="wrap">
       <div class="row reveal">
         <div class="txt">
-          <p class="kicker">Thumbnail grid</p>
+          <p class="kicker">Folders &amp; search</p>
           <h2 id="f-title">Find the right HDRI in seconds</h2>
-          <p class="lead">Open a folder and every .hdr and .exr shows up as a thumbnail — 8K, 16K, even 32K files. No more opening them one by one.</p>
-          <ul class="chips"><li>Folders of any size</li><li>Adjustable size</li><li>Arrow-key browsing</li></ul>
+          <p class="lead">Add your HDRI folders from any drive once — EXRay remembers them and spots new files by itself. Every .hdr and .exr shows up as a thumbnail, even 16K files, and Ctrl+F searches the names across all of them.</p>
+          <ul class="chips"><li>Folders from any drive</li><li>Search all folders</li><li>Include subfolders</li><li>Brightness &amp; range at a glance</li></ul>
         </div>
-        <div class="shot"><img src="@S_grid@" alt="A folder of Poly Haven HDRIs as a thumbnail grid" loading="lazy" width="1280" height="720"></div>
+        <div class="shot"><img src="@S_search@" alt="Searching for clear skies across all HDRI folders, with match counts in the folder tree" loading="lazy" width="1600" height="801"></div>
       </div>
 
       <div class="row flip reveal">
@@ -199,10 +202,10 @@ footer .heart{color:#e04a5a}
         <div class="txt">
           <p class="kicker">Fix HDRI</p>
           <h2>Check it before it lights your scene</h2>
-          <p class="lead">A clipped sun holds only a tiny part of its real light, so shadows go soft and highlights dull. One click finds it — and broken or hot pixels — and tells you how much light is missing. Rebuild the sun with the right brightness for a clear or hazy sky, choose its size and colour, compare before / after and save a clean EXR or HDR. Tested against real unclipped HDRIs: the rebuilt sun lands within about 25 % of the real light.</p>
+          <p class="lead">A clipped sun holds only a tiny part of its real light, so shadows go soft and highlights dull. The Fix HDRI panel opens beside the image, finds it — and broken or hot pixels — and tells you how much light is missing. Rebuild the sun with the right brightness for a clear or hazy sky, choose its size and colour, compare before / after and save a clean EXR or HDR. Tested against real unclipped HDRIs: the rebuilt sun lands within about 25 % of the real light.</p>
           <ul class="chips"><li>Clipped sun rebuild</li><li>Sun size &amp; colour</li><li>Clear or hazy sky</li><li>Sun check</li><li>NaN / hot pixels</li><li>Before / after</li></ul>
         </div>
-        <div class="shot"><img src="@S_fix@" alt="The Fix HDRI window reporting a clipped sun with a sky choice" loading="lazy" width="1280" height="720"></div>
+        <div class="shot"><img src="@S_fixpanel@" alt="The Fix HDRI panel beside the image, reporting a clipped sun with a sky choice" loading="lazy" width="1600" height="801"></div>
       </div>
 
       <div class="row flip reveal">
@@ -235,7 +238,7 @@ footer .heart{color:#e04a5a}
       <p class="kicker">Everything in one small app</p>
       <h2 id="all-title">All of it is free</h2>
       <div class="grid9">
-        <div class="tile reveal"><h3>Thumbnail grid</h3><p>Whole folders of HDRIs at a glance, 16K and up.</p></div>
+        <div class="tile reveal"><h3>Folders &amp; search</h3><p>All your HDRI folders in one tree, thumbnails of 16K files and up, and search across them.</p></div>
         <div class="tile reveal"><h3>Exposure &amp; tonemaps</h3><p>−10 to +10 EV with Clip, Reinhard and ACES.</p></div>
         <div class="tile reveal"><h3>360° view</h3><p>Look around inside equirectangular HDRIs.</p></div>
         <div class="tile reveal"><h3>EXR layers</h3><p>Render passes, depth, normals, motion vectors.</p></div>
@@ -264,6 +267,7 @@ footer .heart{color:#e04a5a}
           <div class="field"><span aria-hidden="true">€</span><input id="gr-price" type="number" min="0" step="1" placeholder="15" aria-label="Your amount in euros"></div>
           <button class="btn btn-ghost" id="gr-buy" type="button">Tip &amp; download</button>
         </div>
+        <p class="small" style="margin-top:22px">Prefer to support it every month? <a href="https://github.com/sponsors/p1xelrise">Sponsor EXRay on GitHub</a>.</p>
         <p class="small">Secure checkout by Gumroad. The download link is emailed to you too, and new versions arrive the same way.</p>
       </div>
     </div>
@@ -281,7 +285,8 @@ footer .heart{color:#e04a5a}
       <p class="note"><b>"Windows protected your PC"?</b> EXRay comes from an independent developer and isn't code-signed yet, so Windows doesn't know it. Click <b>More info → Run anyway</b>.</p>
 
       <h2 style="margin-top:64px">Questions</h2>
-      <details><summary>Is it really free?</summary><p>Yes — every feature, no time limit, no ads, no account. Paying is optional and only supports development.</p></details>
+      <details><summary>Is it really free?</summary><p>Yes — every feature, no time limit, no ads, no account. Paying is optional and only supports development: a tip here, or a monthly <a href="https://github.com/sponsors/p1xelrise">GitHub sponsorship</a>.</p></details>
+      <details><summary>Does removing a folder delete my files?</summary><p>No. Removing a folder only takes it out of EXRay's list — it asks first, and Ctrl+Z brings it back. EXRay never deletes or changes your files; fixed HDRIs are always saved as a new copy.</p></details>
       <details><summary>Is it open source?</summary><p>Yes. EXRay's source code is on <a href="https://github.com/p1xelrise/EXRay">GitHub</a> under the GNU GPL v3. You can read exactly what it does, build it yourself, report bugs or suggest features there.</p></details>
       <details><summary>Can I use it for client work?</summary><p>Yes. Personal and professional use, including paid client work. The images you view, fix or export are yours.</p></details>
       <details><summary>Does it need the internet?</summary><p>No. EXRay works fully offline and collects nothing.</p></details>
@@ -297,7 +302,7 @@ footer .heart{color:#e04a5a}
 
 <footer>
   <div class="wrap">
-    <p>Made with <span class="heart" aria-label="love">❤</span> from Greece by pixelrise · <a href="mailto:pixelrise@gmail.com">pixelrise@gmail.com</a> · <a href="https://github.com/p1xelrise/EXRay">Source code on GitHub</a></p>
+    <p>Made with <span class="heart" aria-label="love">❤</span> from Greece by pixelrise · <a href="mailto:pixelrise@gmail.com">pixelrise@gmail.com</a> · <a href="https://github.com/p1xelrise/EXRay">Source code on GitHub</a> · <a href="https://github.com/sponsors/p1xelrise">Sponsor</a></p>
     <p>EXRay v@VERSION@ · Free, no ads, no tracking, works offline</p>
   </div>
 </footer>

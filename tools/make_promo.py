@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Promo images for the Gumroad page: 1920x1080 covers and a 600x600 thumbnail.
 # Run: python3 tools/make_promo.py   (screenshots in promo/shot_*.png)
-import os
+import os, sys
+sys.path.insert(0, os.path.dirname(__file__))
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -17,26 +18,7 @@ DIM = (160, 164, 172)
 ACCENT = (74, 139, 216)
 WARM = (246, 166, 90)
 
-def icon(size):
-    S = 1024
-    y = np.linspace(0, 1, S)[:, None]; hz = 0.62
-    top, mid, low, gnd = map(lambda c: np.array(c, float), [(22, 40, 92), (86, 110, 170), (246, 150, 72), (28, 30, 38)])
-    t = np.clip(y / hz, 0, 1)
-    sky = np.where(t < 0.6, top + (mid - top) * (t / 0.6), mid + (low - mid) * ((t - 0.6) / 0.4))
-    img = np.broadcast_to(np.where(y < hz, sky, gnd)[:, None, :], (S, S, 3)).copy()
-    yy, xx = np.mgrid[0:S, 0:S] / S
-    cx, cy = 0.5, hz - 0.10
-    d = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-    glow = np.exp(-(d / 0.16) ** 2) * 160 + np.exp(-(d / 0.05) ** 2) * 255
-    glow = np.where(yy < hz, glow, glow * 0.25)
-    img = np.clip(img + glow[..., None] * np.array([1.0, 0.85, 0.6]), 0, 255).astype(np.uint8)
-    base = Image.fromarray(img).convert("RGBA")
-    r = 0.085 * S
-    ImageDraw.Draw(base).ellipse([cx * S - r, cy * S - r, cx * S + r, cy * S + r], fill=(255, 250, 236, 255))
-    m = Image.new("L", (S, S), 0)
-    ImageDraw.Draw(m).rounded_rectangle([int(S * .03)] * 2 + [int(S * .97)] * 2, radius=int(S * .2), fill=255)
-    base.putalpha(m)
-    return base.resize((size, size), Image.LANCZOS)
+from make_promo_icon import icon   # Horizon Sun logo
 
 def background(warm_x=0.75, warm_y=0.15):
     yy, xx = np.mgrid[0:H, 0:W].astype(float)
@@ -140,23 +122,23 @@ x0 = (W - (96 + 28 + tw)) // 2
 img.alpha_composite(ic, (int(x0), 78))
 d.text((x0 + 96 + 28, 126), "EXRay", font=title_font, fill=TEXT, anchor="lm")
 d.text((W // 2, 214), "The fast HDR & EXR viewer for 3D artists", font=F("Inter-SemiBold.otf", 36), fill=TEXT, anchor="mt")
-d.text((W // 2, 272), "Browse, inspect and fix your HDRIs and EXR renders — no Photoshop needed.", font=F("Inter-Regular.otf", 28),
+d.text((W // 2, 272), "All your HDRI folders in one place. Browse, search, inspect and fix them.", font=F("Inter-Regular.otf", 28),
        fill=DIM, anchor="mt")
 d.text((W // 2, 324), "One portable .exe for Windows 11   ·   nothing to install   ·   works offline",
        font=F("Inter-Medium.otf", 24), fill=WARM, anchor="mt")
-fr, pad = framed(os.path.join(P, "shot_image.png"), 1240)
+fr, pad = framed(os.path.join(P, "shot_studio.png"), 1240)
 img.alpha_composite(fr, (W // 2 - fr.width // 2, 392 - pad))
 save(img, "01_hero.jpg")
 
 # 2. Grid.
 img = background(0.85, 0.2)
-fr, pad = framed(os.path.join(P, "shot_grid.png"), 1140)
+fr, pad = framed(os.path.join(P, "shot_search.png"), 1140)
 img.alpha_composite(fr, (W - fr.width + 20, (H - fr.height) // 2))
 brand(img, 110, 90)
-text_block(img, 110, 300, 560, "Thumbnail grid", "Find the right HDRI in seconds",
-           "Open a folder and every .hdr and .exr shows up as a thumbnail — even 16K and bigger. No more opening them one by one.",
-           ["Folders of any size", "Adjustable size", "Arrow-key browsing"])
-save(img, "02_grid.jpg")
+text_block(img, 110, 300, 560, "Folders & search", "Find the right HDRI in seconds",
+           "Add your folders from any drive once. Every .hdr and .exr shows up as a thumbnail, and Ctrl+F searches all of them.",
+           ["Folders from any drive", "Search all folders", "Include subfolders"])
+save(img, "02_folders.jpg")
 
 # 3. 360 view (image left, text right).
 img = background(0.15, 0.25)
@@ -170,12 +152,12 @@ save(img, "03_360.jpg")
 
 # 4. Fix HDRI.
 img = background(0.8, 0.1)
-fr, pad = framed(os.path.join(P, "shot_fix.png"), 1140)
+fr, pad = framed(os.path.join(P, "shot_fixpanel.png"), 1140)
 img.alpha_composite(fr, (W - fr.width + 20, (H - fr.height) // 2))
 brand(img, 110, 90)
 text_block(img, 110, 300, 560, "Fix HDRI", "Check it before it lights your scene",
-           "One click finds a clipped sun, broken pixels and hot pixels. Rebuild the sun, repair the rest, and save a clean EXR or HDR.",
-           ["Clipped sun rebuild", "NaN / hot pixels", "Before / after"])
+           "The Fix HDRI panel finds a clipped sun, broken and hot pixels beside the image. Rebuild the sun, repair the rest, save a clean copy.",
+           ["Clipped sun rebuild", "Clear or hazy sky", "Before / after"])
 save(img, "04_fix.jpg")
 
 # 5. Render passes (image left, text right).
@@ -207,7 +189,7 @@ brand(img, 110, 80)
 d.text((110, 170), "Everything for HDR & EXR files, in one small app", font=F("InterDisplay-Bold.otf", 58), fill=TEXT)
 d.text((W - 110, 1052), "Free for everyone \u2014 every feature, no time limit", font=F("Inter-Medium.otf", 22), fill=DIM, anchor="rs")
 tiles = [
-    ("Thumbnail grid", "Whole folders of HDRIs at a glance, 16K and up."),
+    ("Folders & search", "All your HDRI folders in one tree, searched in a second."),
     ("Exposure & tonemaps", "−10 to +10 EV with Clip, Reinhard and ACES."),
     ("360° view", "Look around inside equirectangular HDRIs."),
     ("EXR layers", "Render passes, depth, normals, motion vectors."),
